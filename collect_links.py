@@ -489,7 +489,7 @@ def main():
                         item_href = first_item.get("item_href", "")
                         if item_href:
                             logger.info(
-                                f"Получение data-zoom для обновления section_href из первого item..."
+                                "Получение data-zoom для обновления section_href из первого item..."
                             )
                             data_zoom = get_zoom_from_item(page, item_href)
                             if data_zoom:
