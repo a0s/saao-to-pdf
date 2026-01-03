@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from playwright.sync_api import sync_playwright
 
@@ -24,8 +25,25 @@ logger = logging.getLogger(__name__)
 METADATA_FILE = "links_metadata.json"
 OUTPUT_PDF = "combined_saa_pdf.pdf"
 TIMEOUT = 30000  # 30 секунд
-MAX_SECTIONS = 2  # Обрабатываем первые 2 секции
-MAX_ITEMS_PER_SECTION = None  # Обрабатываем все элементы в секции
+MAX_SECTIONS = None  # None = обрабатывать все секции, или укажите число для ограничения
+MAX_ITEMS_PER_SECTION = (
+    None  # None = обрабатывать все элементы в секции, или укажите число для ограничения
+)
+
+
+def format_time(seconds):
+    """Форматирует время в читаемый вид (чч:мм:сс или мм:сс)"""
+    if seconds < 60:
+        return f"{int(seconds)}с"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}м {secs}с"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours}ч {minutes}м {secs}с"
 
 
 def load_metadata():
@@ -628,9 +646,14 @@ def main():
         logger.error("Нет секций в метаданных")
         return
 
-    # Ограничиваемся первыми MAX_SECTIONS секциями
-    sections_to_process = sections[:MAX_SECTIONS]
-    logger.info(f"Обработка {len(sections_to_process)} секций")
+    # Ограничиваемся первыми MAX_SECTIONS секциями (если указано)
+    if MAX_SECTIONS is None:
+        sections_to_process = sections
+    else:
+        sections_to_process = sections[:MAX_SECTIONS]
+    logger.info(
+        f"Обработка {len(sections_to_process)} секций (всего в файле: {len(sections)})"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -673,6 +696,7 @@ def main():
             else:
                 total_items = sum(len(s.get("items", [])) for s in sections_to_process)
             processed = 0
+            start_time = time.time()
 
             for section_idx, section in enumerate(sections_to_process):
                 section_name = section.get("section_name", "")
@@ -700,7 +724,25 @@ def main():
                     item_url = item.get("item_href", "")
 
                     processed += 1
-                    logger.info(f"Прогресс: {processed}/{total_items}")
+
+                    # Вычисляем время и оставшееся время
+                    elapsed_time = time.time() - start_time
+                    if processed > 0:
+                        avg_time_per_item = elapsed_time / processed
+                        remaining_items = total_items - processed
+                        estimated_remaining_time = avg_time_per_item * remaining_items
+
+                        # Форматируем время
+                        elapsed_str = format_time(elapsed_time)
+                        remaining_str = format_time(estimated_remaining_time)
+
+                        logger.info(
+                            f"Прогресс: {processed}/{total_items} | "
+                            f"Прошло: {elapsed_str} | "
+                            f"Осталось ~{remaining_str}"
+                        )
+                    else:
+                        logger.info(f"Прогресс: {processed}/{total_items}")
 
                     # Первый элемент в первой секции не должен иметь разрыв страницы
                     is_first_item = section_idx == 0 and item_idx == 0
@@ -722,7 +764,9 @@ def main():
             # Шаг 5: Генерируем PDF (используем существующую страницу)
             print_combined_pdf(page, combined_html, OUTPUT_PDF)
 
+            total_time = time.time() - start_time
             logger.info("✅ Генерация завершена успешно!")
+            logger.info(f"⏱️  Общее время выполнения: {format_time(total_time)}")
 
         except Exception as e:
             logger.error(f"Критическая ошибка: {e}", exc_info=True)
