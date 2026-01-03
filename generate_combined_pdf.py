@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 METADATA_FILE = "links_metadata.json"
 OUTPUT_PDF = "combined_saa_pdf.pdf"
 TIMEOUT = 30000  # 30 секунд
-MAX_SECTIONS = 1  # Обрабатываем первую секцию
-MAX_ITEMS_PER_SECTION = 5  # Обрабатываем первые 5 элементов в секции
+MAX_SECTIONS = 2  # Обрабатываем первые 2 секции
+MAX_ITEMS_PER_SECTION = None  # Обрабатываем все элементы в секции
 
 
 def load_metadata():
@@ -433,8 +433,13 @@ def combine_html_document(original_styles, toc_html, content_parts):
 
   .section-header {{
     page-break-after: avoid;
+    page-break-inside: avoid;
     margin-top: 2em;
     margin-bottom: 1em;
+  }}
+
+  .section-header:not(:first-of-type) {{
+    page-break-before: always !important;
   }}
 
   .section-title {{
@@ -660,10 +665,13 @@ def main():
             # Шаг 3: Обрабатываем все элементы
             content_parts = []
             # Пересчитываем total_items с учетом ограничений
-            total_items = sum(
-                min(len(s.get("items", [])), MAX_ITEMS_PER_SECTION)
-                for s in sections_to_process
-            )
+            if MAX_ITEMS_PER_SECTION:
+                total_items = sum(
+                    min(len(s.get("items", [])), MAX_ITEMS_PER_SECTION)
+                    for s in sections_to_process
+                )
+            else:
+                total_items = sum(len(s.get("items", [])) for s in sections_to_process)
             processed = 0
 
             for section_idx, section in enumerate(sections_to_process):
@@ -672,18 +680,20 @@ def main():
 
                 # Добавляем якорь секции с заголовком
                 section_anchor = f"section-{section_idx}"
-                # Первая секция не должна иметь разрыв страницы
-                page_break = (
-                    "page-break-before: always;"
-                    if section_idx > 0
-                    else "page-break-before: auto;"
-                )
+                # Все секции кроме первой должны начинаться с новой страницы
+                if section_idx > 0:
+                    page_break = "page-break-before: always !important;"
+                else:
+                    page_break = "page-break-before: auto;"
                 section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
                 content_parts.append(section_header)
 
                 items = section.get("items", [])
-                # Ограничиваем количество элементов для теста
-                items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                # Ограничиваем количество элементов если указано
+                if MAX_ITEMS_PER_SECTION:
+                    items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                else:
+                    items_to_process = items
 
                 for item_idx, item in enumerate(items_to_process):
                     item_name = item.get("item_name", "")
