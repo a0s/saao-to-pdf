@@ -3,9 +3,9 @@
 Скрипт для печати страницы Oracc в PDF с исправлением обрезания текста
 """
 
-from playwright.sync_api import sync_playwright
 import sys
-import os
+
+from playwright.sync_api import sync_playwright
 
 # CSS стили для исправления обрезания текста при печати
 PRINT_FIX_CSS = """
@@ -21,12 +21,27 @@ PRINT_FIX_CSS = """
     overflow: visible !important;
   }
 
-  /* Скрываем заголовки и навигацию полностью */
+  /* Скрываем навигацию, но оставляем заголовки */
   header, nav, .header, .navigation, .breadcrumb,
-  #p4MenuOutline, .p4MenuOutline, .menu, .sidebar,
-  h1:first-of-type, h2:first-of-type,
-  body > div:first-child, body > section:first-child {
+  #p4MenuOutline, .p4MenuOutline, .menu, .sidebar {
     display: none !important;
+  }
+
+  /* Стили для заголовков документа */
+  .doc-title-h2, .doc-title-h3 {
+    page-break-after: avoid !important;
+    page-break-inside: avoid !important;
+    margin-top: 0.5em !important;
+    margin-bottom: 0.3em !important;
+    font-weight: bold !important;
+  }
+
+  .doc-title-h2 {
+    font-size: 1.2em !important;
+  }
+
+  .doc-title-h3 {
+    font-size: 1.1em !important;
   }
 
   /* Убираем лишние отступы сверху и пустые страницы */
@@ -193,10 +208,10 @@ def inject_print_styles(page):
     """Инжектирует стили для печати в страницу"""
     page.add_style_tag(content=PRINT_FIX_CSS)
 
-    # Скрываем лишние элементы через JavaScript
-    hide_script = """
+    # Подготовка страницы для печати через JavaScript
+    prepare_script = """
     (function() {
-      // Скрываем навигацию, заголовки и лишние элементы
+      // Скрываем навигацию и лишние элементы
       const elementsToHide = [
         'header', 'nav', '.header', '.navigation', '.breadcrumb',
         '#p4MenuOutline', '.p4MenuOutline', '.menu', '.sidebar'
@@ -211,7 +226,53 @@ def inject_print_styles(page):
         } catch(e) {}
       });
 
-      // Находим первую таблицу и скрываем все элементы до неё
+      // Находим заголовки
+      const titleElement = document.querySelector('#p4HeadTitle');
+      const subtitleElement = document.querySelector('h1.p3h2 > a, h1.p3h2');
+
+      // Извлекаем текст заголовков
+      let titleText = '';
+      let subtitleText = '';
+
+      if (titleElement) {
+        titleText = titleElement.textContent.trim();
+      }
+
+      if (subtitleElement) {
+        subtitleText = subtitleElement.textContent.trim();
+        // Убираем лишний текст типа [via saao/saa01] если есть
+        subtitleText = subtitleText.replace(/\\s*\\[via[^\\]]+\\]\\s*/gi, '').trim();
+      }
+
+      // Создаем контейнер для заголовков
+      const headerContainer = document.createElement('div');
+      headerContainer.className = 'doc-headers';
+      headerContainer.style.marginBottom = '1em';
+
+      // Создаем первый заголовок (h2) с якорем
+      if (titleText) {
+        const h2 = document.createElement('h2');
+        h2.className = 'doc-title-h2';
+        h2.id = 'doc-title';
+        h2.textContent = titleText;
+        headerContainer.appendChild(h2);
+      }
+
+      // Создаем второй заголовок (h3) с якорем
+      if (subtitleText) {
+        const h3 = document.createElement('h3');
+        h3.className = 'doc-title-h3';
+        // Создаем ID из текста заголовка (для якоря)
+        const anchorId = subtitleText.toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .substring(0, 50);
+        h3.id = anchorId || 'doc-subtitle';
+        h3.textContent = subtitleText;
+        headerContainer.appendChild(h3);
+      }
+
+      // Находим первую таблицу
       const tables = document.querySelectorAll('table');
       if (tables.length > 0) {
         const firstTable = tables[0];
@@ -238,22 +299,35 @@ def inject_print_styles(page):
           parent = parent.parentElement;
         }
 
-        // Перемещаем таблицу в начало body для правильной печати
-        if (firstTable.parentElement !== document.body) {
-          const clone = firstTable.cloneNode(true);
-          document.body.insertBefore(clone, document.body.firstChild);
-          firstTable.style.display = 'none';
+        // Вставляем заголовки перед таблицей
+        if (headerContainer.children.length > 0) {
+          if (firstTable.parentElement === document.body) {
+            firstTable.parentElement.insertBefore(headerContainer, firstTable);
+          } else {
+            // Если таблица не в body, перемещаем и таблицу, и заголовки
+            const container = document.createElement('div');
+            container.className = 'doc-content';
+            container.appendChild(headerContainer);
+
+            const clone = firstTable.cloneNode(true);
+            container.appendChild(clone);
+
+            document.body.insertBefore(container, document.body.firstChild);
+            firstTable.style.display = 'none';
+          }
+        }
+      } else {
+        // Если таблицы нет, просто добавляем заголовки в начало body
+        if (headerContainer.children.length > 0) {
+          document.body.insertBefore(headerContainer, document.body.firstChild);
         }
       }
 
-      // Скрываем все заголовки h1, h2 в начале документа
-      const headings = document.querySelectorAll('h1, h2');
-      headings.forEach((h, index) => {
-        // Скрываем первые 2 заголовка (обычно это навигация)
-        if (index < 2) {
-          h.style.display = 'none';
-        }
-      });
+      // Скрываем оригинальные заголовки
+      if (titleElement) titleElement.style.display = 'none';
+      if (subtitleElement && subtitleElement.parentElement) {
+        subtitleElement.parentElement.style.display = 'none';
+      }
 
       // Убираем пустые элементы
       const allElements = document.querySelectorAll('div, p, section');
@@ -267,7 +341,7 @@ def inject_print_styles(page):
       document.querySelectorAll('hr').forEach(hr => hr.style.display = 'none');
     })();
     """
-    page.evaluate(hide_script)
+    page.evaluate(prepare_script)
     print("✅ Стили для печати успешно добавлены")
 
 
@@ -301,14 +375,9 @@ def print_to_pdf(url, output_path=None):
         page.pdf(
             path=output_path,
             format="A4",
-            margin={
-                "top": "1cm",
-                "right": "0.8cm",
-                "bottom": "1.5cm",
-                "left": "0.8cm"
-            },
+            margin={"top": "1cm", "right": "0.8cm", "bottom": "1.5cm", "left": "0.8cm"},
             print_background=False,
-            prefer_css_page_size=True
+            prefer_css_page_size=True,
         )
 
         browser.close()
@@ -325,4 +394,3 @@ if __name__ == "__main__":
         output = sys.argv[2] if len(sys.argv) > 2 else "page.pdf"
 
     print_to_pdf(url, output)
-
