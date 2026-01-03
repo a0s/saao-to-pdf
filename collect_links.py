@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-BASE_URL = "https://oracc.museum.upenn.edu/saao?zoom=1"
+BASE_URL = "https://oracc.museum.upenn.edu/saao"
 METADATA_FILE = "links_metadata.json"
 TIMEOUT = 30000  # 30 секунд
 
@@ -114,6 +114,36 @@ def return_to_table_from_item(page, section_href):
         except Exception as e2:
             logger.error(f"Не удалось вернуться к таблице: {e2}")
             return False
+
+
+def get_zoom_from_item(page, item_url):
+    """Получить значение data-zoom из элемента p4Pager на странице item"""
+    try:
+        # Открываем страницу item
+        logger.info(f"Открытие страницы item для получения data-zoom: {item_url}")
+        page.goto(item_url, wait_until="domcontentloaded", timeout=TIMEOUT)
+        page.wait_for_timeout(2000)  # Пауза для полной загрузки
+
+        # Находим элемент p4Pager
+        p4pager = page.locator("div#p4Pager")
+        p4pager.wait_for(state="visible", timeout=TIMEOUT)
+
+        # Получаем значение data-zoom
+        data_zoom = p4pager.get_attribute("data-zoom", timeout=2000)
+
+        if data_zoom:
+            logger.info(f"Найдено data-zoom: {data_zoom}")
+            return data_zoom
+        else:
+            logger.warning("Не удалось найти атрибут data-zoom в элементе p4Pager")
+            return None
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении data-zoom из item {item_url}: {e}")
+        import traceback
+
+        logger.debug(traceback.format_exc())
+        return None
 
 
 def collect_all_items_from_section(page, section_name, section_href, metadata):
@@ -401,8 +431,9 @@ def main():
 
         try:
             # Открываем страницу
-            logger.info(f"Открытие страницы: {BASE_URL}")
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+            initial_url = f"{BASE_URL}?zoom=1"
+            logger.info(f"Открытие страницы: {initial_url}")
+            page.goto(initial_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(1000)  # Минимальная пауза для загрузки
 
             # Находим все ссылки в левой колонке
@@ -451,6 +482,36 @@ def main():
                     items = collect_all_items_from_section(
                         page, section_name, section_href, metadata
                     )
+
+                    # Обновляем section_href, извлекая data-zoom из первого item
+                    if items:
+                        first_item = items[0]
+                        item_href = first_item.get("item_href", "")
+                        if item_href:
+                            logger.info(
+                                f"Получение data-zoom для обновления section_href из первого item..."
+                            )
+                            data_zoom = get_zoom_from_item(page, item_href)
+                            if data_zoom:
+                                section_href = f"{BASE_URL}?zoom={data_zoom}"
+                                logger.info(
+                                    f"✓ Обновлен section_href для '{section_name}': {section_href}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Не удалось получить data-zoom для '{section_name}', используется исходный section_href"
+                                )
+
+                            # Возвращаемся к таблице раздела после получения data-zoom
+                            return_to_table_from_item(page, section_href)
+                        else:
+                            logger.warning(
+                                f"Первый item раздела '{section_name}' не имеет href, используется исходный section_href"
+                            )
+                    else:
+                        logger.warning(
+                            f"Раздел '{section_name}' не содержит items, используется исходный section_href"
+                        )
 
                     # Добавляем раздел в метаданные
                     section_data = {
