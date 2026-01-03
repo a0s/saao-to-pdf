@@ -4,7 +4,6 @@
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -381,11 +380,13 @@ def sanitize_filename(filename):
     # Заменяем недопустимые символы на подчеркивания
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
-        filename = filename.replace(char, '_')
+        filename = filename.replace(char, "_")
     return filename
 
 
-def process_items(metadata_file="links_metadata.json", output_dir="pdf-chunks", test_mode=True):
+def process_items(
+    metadata_file="links_metadata.json", output_dir="pdf-chunks", test_mode=True
+):
     """
     Обрабатывает items из links_metadata.json и генерирует PDF
 
@@ -438,7 +439,9 @@ def process_items(metadata_file="links_metadata.json", output_dir="pdf-chunks", 
                 continue
 
             # Обрабатываем заголовки: заменяем \t на пробелы
-            title_text = item_full_name.replace("\t", " ").strip() if item_full_name else ""
+            title_text = (
+                item_full_name.replace("\t", " ").strip() if item_full_name else ""
+            )
             subtitle_text = item_text.replace("\t", " ").strip() if item_text else ""
 
             # Если title_text пустой, используем item_name
@@ -466,7 +469,7 @@ def process_items(metadata_file="links_metadata.json", output_dir="pdf-chunks", 
                 continue
 
     print(f"\n{'='*60}")
-    print(f"Обработка завершена!")
+    print("Обработка завершена!")
     print(f"Всего items: {total_items}")
     print(f"Успешно обработано: {processed_items}")
     print(f"Ошибок: {total_items - processed_items}")
@@ -483,4 +486,3 @@ if __name__ == "__main__":
         print("Для полной обработки используйте: python generate_item_pdfs.py --full")
 
     process_items(test_mode=test_mode)
-

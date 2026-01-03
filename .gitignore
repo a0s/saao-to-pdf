@@ -4,3 +4,4 @@ venv/
 *.json
 *.json*
 *.html
+__pycache__/
