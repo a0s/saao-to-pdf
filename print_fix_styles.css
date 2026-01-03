@@ -1,0 +1,177 @@
+/* Стили для исправления обрезания текста при печати в PDF */
+
+@media print {
+
+  /* Основные настройки страницы */
+  @page {
+    margin: 1.5cm 1cm 2cm 1cm;
+    /* Увеличенный нижний отступ */
+    size: A4;
+  }
+
+  /* Предотвращение обрезания контента */
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  /* Правильные переносы текста - предотвращение разрыва посреди буквы */
+  * {
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+    hyphens: auto !important;
+    -webkit-hyphens: auto !important;
+    -moz-hyphens: auto !important;
+    -ms-hyphens: auto !important;
+  }
+
+  /* Предотвращение разрыва страниц внутри важных блоков */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    page-break-after: avoid !important;
+    page-break-inside: avoid !important;
+    page-break-before: avoid !important;
+    orphans: 4 !important;
+    widows: 4 !important;
+  }
+
+  /* Защита таблиц от разрыва - строгие правила */
+  table {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    page-break-before: auto !important;
+    page-break-after: auto !important;
+  }
+
+  thead,
+  tbody {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  tr {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    page-break-after: avoid !important;
+  }
+
+  td,
+  th {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+
+  /* Защита параграфов и блоков текста */
+  p,
+  div,
+  section,
+  article {
+    orphans: 4 !important;
+    widows: 4 !important;
+    page-break-inside: avoid !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+
+  /* Предотвращение разрыва списков */
+  ul,
+  ol {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  li {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  /* Удаление фиксированных позиций */
+  * {
+    position: relative !important;
+  }
+
+  /* Удаление overflow: hidden */
+  * {
+    overflow: visible !important;
+  }
+
+  /* Увеличение минимальной высоты для предотвращения обрезания */
+  body,
+  html {
+    min-height: auto !important;
+    height: auto !important;
+  }
+
+  /* Удаление фиксированных высот */
+  div,
+  section,
+  article {
+    min-height: auto !important;
+    max-height: none !important;
+  }
+
+  /* Настройка отступов для предотвращения обрезания */
+  .content,
+  main,
+  #content,
+  [role="main"] {
+    padding-bottom: 2cm !important;
+    margin-bottom: 1cm !important;
+  }
+
+  /* Удаление фона и ненужных элементов при печати */
+  nav,
+  header,
+  footer,
+  .navigation,
+  .menu,
+  .sidebar {
+    display: none !important;
+  }
+
+  /* Улучшение видимости текста */
+  * {
+    color: #000 !important;
+    background: transparent !important;
+  }
+
+  /* Предотвращение разрыва ссылок */
+  a {
+    page-break-inside: avoid !important;
+    word-break: break-word !important;
+  }
+
+  /* Защита изображений */
+  img {
+    max-width: 100% !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  /* Настройка для блоков с кодом или специальным форматированием */
+  pre,
+  code,
+  blockquote {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    white-space: pre-wrap !important;
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+
+  /* Специальные правила для строк таблицы - не разрывать строки внутри ячеек */
+  table td,
+  table th {
+    white-space: normal !important;
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+  }
+}
