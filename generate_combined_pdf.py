@@ -1737,10 +1737,13 @@ async def main_async():
                 chunk_pdf_paths = []
 
                 if args.skip_chunk_download:
-                    logger.info("Пропуск этапа скачивания чанков (--skip-chunk-download)")
+                    logger.info(
+                        "Пропуск этапа скачивания чанков (--skip-chunk-download)"
+                    )
                     for chunk_idx in range(len(section_chunks)):
                         chunk_pdf_path = os.path.join(
-                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.pdf"
+                            chunks_dir,
+                            f"combined_document_part_{chunk_idx + 1:03d}.pdf",
                         )
                         if os.path.exists(chunk_pdf_path):
                             chunk_reader = PdfReader(chunk_pdf_path)
@@ -1793,7 +1796,9 @@ async def main_async():
                                 item_url = item.get("item_href", "")
 
                                 is_first_item = (
-                                    chunk_idx == 0 and section_idx == 0 and item_idx == 0
+                                    chunk_idx == 0
+                                    and section_idx == 0
+                                    and item_idx == 0
                                 )
 
                                 tasks.append(
@@ -1842,13 +1847,15 @@ async def main_async():
                         )
 
                         chunk_html_path = os.path.join(
-                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.html"
+                            chunks_dir,
+                            f"combined_document_part_{chunk_idx + 1:03d}.html",
                         )
                         with open(chunk_html_path, "w", encoding="utf-8") as f:
                             f.write(chunk_html)
 
                         chunk_pdf_path = os.path.join(
-                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.pdf"
+                            chunks_dir,
+                            f"combined_document_part_{chunk_idx + 1:03d}.pdf",
                         )
 
                         try:
@@ -1883,7 +1890,9 @@ async def main_async():
                                 f"Ошибка при генерации части {chunk_idx + 1}: {e}",
                                 exc_info=True,
                             )
-                            logger.warning(f"Пропускаем часть {chunk_idx + 1} и продолжаем")
+                            logger.warning(
+                                f"Пропускаем часть {chunk_idx + 1} и продолжаем"
+                            )
 
                 if not chunk_pdf_paths:
                     logger.error("Не удалось сгенерировать ни одной части")
