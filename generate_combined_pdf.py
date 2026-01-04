@@ -5,16 +5,17 @@
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import time
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
-# Импортируем стили и функции из print_with_fix.py
-from print_with_fix import PRINT_FIX_CSS, inject_print_styles
+# Импортируем стили из print_with_fix.py
+from print_with_fix import PRINT_FIX_CSS
 
 # Настройка логирования
 logging.basicConfig(
@@ -61,14 +62,14 @@ def load_metadata():
         return None
 
 
-def extract_original_styles(page):
+async def extract_original_styles(page):
     """
     Извлечь оригинальные CSS стили из страницы
     Стили одинаковы для всех страниц, поэтому извлекаем один раз
     """
     logger.info("Извлечение оригинальных CSS стилей...")
 
-    styles_html = page.evaluate(
+    styles_html = await page.evaluate(
         """
     () => {
       let styles = '';
@@ -301,7 +302,84 @@ def generate_toc_html(sections, include_page_numbers=True):
     return toc_css + toc_html
 
 
-def process_item_page(page, item_url, item_name, is_first_item=False):
+async def inject_print_styles_async(page):
+    """Async версия inject_print_styles"""
+    await page.add_style_tag(content=PRINT_FIX_CSS)
+
+    # Подготовка страницы для печати через JavaScript
+    prepare_script = """
+    (function() {
+      // Скрываем навигацию и лишние элементы
+      const elementsToHide = [
+        'header', 'nav', '.header', '.navigation', '.breadcrumb',
+        '#p4MenuOutline', '.p4MenuOutline', '.menu', '.sidebar'
+      ];
+
+      elementsToHide.forEach(selector => {
+        try {
+          const elements = document.querySelectorAll(selector);
+          elements.forEach(el => {
+            if (el) el.style.display = 'none';
+          });
+        } catch(e) {}
+      });
+
+      // Находим заголовки
+      const titleElement = document.querySelector('#p4HeadTitle');
+      const subtitleElement = document.querySelector('h1.p3h2 > a, h1.p3h2');
+
+      // Извлекаем текст заголовков
+      let titleText = '';
+      let subtitleText = '';
+
+      if (titleElement) {
+        titleText = titleElement.textContent.trim();
+      }
+
+      if (subtitleElement) {
+        subtitleText = subtitleElement.textContent.trim();
+        // Убираем лишний текст типа [via saao/saa01] если есть
+        subtitleText = subtitleText.replace(/\\s*\\[via[^\\]]+\\]\\s*/gi, '').trim();
+      }
+
+      // Создаем контейнер для заголовков
+      const headerContainer = document.createElement('div');
+      headerContainer.className = 'doc-headers';
+      headerContainer.style.marginBottom = '1em';
+
+      // Создаем первый заголовок (h2) с якорем
+      if (titleText) {
+        const h2 = document.createElement('h2');
+        h2.className = 'doc-title-h2';
+        h2.id = 'doc-title';
+        h2.textContent = titleText;
+        headerContainer.appendChild(h2);
+      }
+
+      // Создаем второй заголовок (h3) с якорем
+      if (subtitleText) {
+        const h3 = document.createElement('h3');
+        h3.className = 'doc-title-h3';
+        h3.id = 'doc-subtitle';
+        h3.textContent = subtitleText;
+        headerContainer.appendChild(h3);
+      }
+
+      // Вставляем контейнер в начало body
+      if (headerContainer.children.length > 0) {
+        const body = document.body;
+        if (body.firstChild) {
+          body.insertBefore(headerContainer, body.firstChild);
+        } else {
+          body.appendChild(headerContainer);
+        }
+      }
+    })();
+    """
+    await page.evaluate(prepare_script)
+
+
+async def process_item_page(page, item_url, item_name, is_first_item=False):
     """
     Загрузить и обработать страницу элемента
     Возвращает обработанный HTML контент
@@ -320,15 +398,15 @@ def process_item_page(page, item_url, item_name, is_first_item=False):
         logger.info(f"Обработка: {item_name} - {item_url}")
 
         # Загружаем страницу
-        page.goto(item_url, wait_until="networkidle", timeout=TIMEOUT)
-        page.wait_for_timeout(1000)  # Дополнительная пауза для загрузки
+        await page.goto(item_url, wait_until="networkidle", timeout=TIMEOUT)
+        await page.wait_for_timeout(1000)  # Дополнительная пауза для загрузки
 
         # Применяем стили для печати
-        inject_print_styles(page)
-        page.wait_for_timeout(500)
+        await inject_print_styles_async(page)
+        await page.wait_for_timeout(500)
 
         # Извлекаем обработанный контент
-        content_html = page.evaluate(
+        content_html = await page.evaluate(
             """
         () => {
           // Находим контейнер с заголовками и таблицей
@@ -624,16 +702,16 @@ def combine_html_document(original_styles, toc_html, content_parts, toc_only=Fal
     return full_html
 
 
-def print_toc_only_pdf(page, html_content, output_path):
+async def print_toc_only_pdf(page, html_content, output_path):
     """Распечатать только оглавление в PDF (без номеров страниц)"""
     logger.info(f"Генерация PDF только с оглавлением: {output_path}")
 
     # Загружаем HTML контент
-    page.set_content(html_content, wait_until="networkidle")
-    page.wait_for_timeout(2000)  # Даем время на применение стилей
+    await page.set_content(html_content, wait_until="networkidle")
+    await page.wait_for_timeout(2000)  # Даем время на применение стилей
 
     # Печатаем в PDF
-    page.pdf(
+    await page.pdf(
         path=output_path,
         format="A4",
         margin={"top": "1cm", "right": "0.8cm", "bottom": "1.5cm", "left": "0.8cm"},
@@ -644,17 +722,17 @@ def print_toc_only_pdf(page, html_content, output_path):
     logger.info(f"✅ PDF с оглавлением успешно сохранен: {output_path}")
 
 
-def print_combined_pdf(page, html_content, output_path):
+async def print_combined_pdf(page, html_content, output_path):
     """Распечатать объединенный HTML в PDF используя существующую страницу"""
     logger.info(f"Генерация PDF: {output_path}")
 
     # Загружаем HTML контент
-    page.set_content(html_content, wait_until="networkidle")
-    page.wait_for_timeout(2000)  # Даем время на применение стилей
+    await page.set_content(html_content, wait_until="networkidle")
+    await page.wait_for_timeout(2000)  # Даем время на применение стилей
 
     # Вычисляем номера страниц для оглавления
     logger.info("Вычисление номеров страниц для оглавления...")
-    result = page.evaluate(
+    result = await page.evaluate(
         """
     () => {
       // Эмулируем размеры страницы A4 при печати
@@ -778,10 +856,10 @@ def print_combined_pdf(page, html_content, output_path):
                 f"Не найдено якорей для {result.get('notFound', 0)} элементов (возможно, они не обрабатываются)"
             )
 
-    page.wait_for_timeout(500)  # Даем время на обновление
+    await page.wait_for_timeout(500)  # Даем время на обновление
 
     # Печатаем в PDF
-    page.pdf(
+    await page.pdf(
         path=output_path,
         format="A4",
         margin={"top": "1cm", "right": "0.8cm", "bottom": "1.5cm", "left": "0.8cm"},
@@ -790,6 +868,89 @@ def print_combined_pdf(page, html_content, output_path):
     )
 
     logger.info(f"✅ PDF успешно сохранен: {output_path}")
+
+
+async def process_items_parallel(playwright_instance, tasks, worker_count=10):
+    """
+    Параллельная обработка элементов с сохранением порядка
+
+    Args:
+        playwright_instance: Экземпляр Playwright
+        tasks: Список кортежей (index, item_url, item_name, is_first_item)
+        worker_count: Количество воркеров (браузеров)
+
+    Returns:
+        Список кортежей (index, content) отсортированный по index
+    """
+    logger.info(f"Запуск параллельной обработки с {worker_count} воркерами...")
+
+    # Создаем семафор для ограничения количества одновременных задач
+    semaphore = asyncio.Semaphore(worker_count)
+    results = {}
+    start_time = time.time()
+    total_tasks = len(tasks)
+    completed = 0
+    completed_lock = asyncio.Lock()
+
+    async def process_task(task_data):
+        """Обработать одну задачу"""
+        nonlocal completed
+        index, item_url, item_name, is_first_item = task_data
+
+        async with semaphore:
+            # Создаем браузер для этой задачи
+            browser = await playwright_instance.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                try:
+                    content = await process_item_page(
+                        page, item_url, item_name, is_first_item
+                    )
+                finally:
+                    await page.close()
+            finally:
+                await browser.close()
+
+            # Обновляем прогресс
+            async with completed_lock:
+                completed += 1
+                elapsed_time = time.time() - start_time
+                if completed > 0:
+                    avg_time_per_item = elapsed_time / completed
+                    remaining_items = total_tasks - completed
+                    estimated_remaining_time = avg_time_per_item * remaining_items
+
+                    elapsed_str = format_time(elapsed_time)
+                    remaining_str = format_time(estimated_remaining_time)
+
+                    logger.info(
+                        f"Прогресс: {completed}/{total_tasks} | "
+                        f"Прошло: {elapsed_str} | "
+                        f"Осталось ~{remaining_str}"
+                    )
+
+            return (index, content)
+
+    # Запускаем все задачи параллельно
+    try:
+        coroutines = [process_task(task) for task in tasks]
+        task_results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+        # Собираем результаты
+        for result in task_results:
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка при обработке задачи: {result}")
+                continue
+            index, content = result
+            results[index] = content
+    except Exception as e:
+        logger.error(f"Критическая ошибка при параллельной обработке: {e}")
+
+    # Возвращаем результаты в правильном порядке
+    sorted_results = [results.get(i, None) for i in range(len(tasks))]
+    logger.info(f"✅ Параллельная обработка завершена: {total_tasks} элементов")
+
+    return sorted_results
 
 
 def parse_arguments():
@@ -826,11 +987,17 @@ def parse_arguments():
         default=None,
         help="Количество секций для обработки (по умолчанию: все секции от section-start до конца)",
     )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=20,
+        help="Количество параллельных воркеров (браузеров) для обработки страниц (по умолчанию: 10)",
+    )
     return parser.parse_args()
 
 
-def main():
-    """Основная функция"""
+async def main_async():
+    """Основная async функция"""
     # Парсим аргументы командной строки
     args = parse_arguments()
 
@@ -896,9 +1063,9 @@ def main():
         f"Обработка секций {section_start}-{section_end-1} ({len(sections_to_process)} секций из {total_sections} всего)"
     )
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
 
         try:
             if args.table_of_content_only:
@@ -923,7 +1090,7 @@ def main():
                 logger.info(f"✅ HTML файл сохранен: {output_html}")
 
                 # Шаг 4: Генерируем PDF только с оглавлением
-                print_toc_only_pdf(page, combined_html, output_pdf)
+                await print_toc_only_pdf(page, combined_html, output_pdf)
 
                 logger.info("✅ Генерация оглавления завершена успешно!")
             else:
@@ -947,32 +1114,24 @@ def main():
                 logger.info(
                     f"Загрузка образца страницы для извлечения стилей: {first_url}"
                 )
-                page.goto(first_url, wait_until="networkidle", timeout=TIMEOUT)
-                page.wait_for_timeout(1000)
+                await page.goto(first_url, wait_until="networkidle", timeout=TIMEOUT)
+                await page.wait_for_timeout(1000)
 
-                original_styles = extract_original_styles(page)
+                original_styles = await extract_original_styles(page)
 
                 # Шаг 2: Генерируем оглавление
                 toc_html = generate_toc_html(sections_to_process)
 
-                # Шаг 3: Обрабатываем все элементы
-                content_parts = []
-                # Пересчитываем total_items с учетом ограничений
-                if MAX_ITEMS_PER_SECTION:
-                    total_items = sum(
-                        min(len(s.get("items", [])), MAX_ITEMS_PER_SECTION)
-                        for s in sections_to_process
-                    )
-                else:
-                    total_items = sum(
-                        len(s.get("items", [])) for s in sections_to_process
-                    )
-                processed = 0
-                start_time = time.time()
+                # Шаг 3: Собираем все задачи для параллельной обработки
+                tasks = (
+                    []
+                )  # Список кортежей (index, item_url, item_name, is_first_item)
+                section_headers = []  # Заголовки секций с их индексами
 
+                task_index = 0
                 for section_idx, section in enumerate(sections_to_process):
                     section_name = section.get("section_name", "")
-                    logger.info(f"Обработка секции {section_idx + 1}: {section_name}")
+                    logger.info(f"Подготовка секции {section_idx + 1}: {section_name}")
 
                     # Добавляем якорь секции с заголовком
                     section_anchor = f"section-{section_idx}"
@@ -982,7 +1141,7 @@ def main():
                     else:
                         page_break = "page-break-before: auto;"
                     section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
-                    content_parts.append(section_header)
+                    section_headers.append((section_idx, section_header))
 
                     items = section.get("items", [])
                     # Ограничиваем количество элементов если указано
@@ -995,50 +1154,60 @@ def main():
                         item_name = item.get("item_name", "")
                         item_url = item.get("item_href", "")
 
-                        processed += 1
-
-                        # Вычисляем время и оставшееся время
-                        elapsed_time = time.time() - start_time
-                        if processed > 0:
-                            avg_time_per_item = elapsed_time / processed
-                            remaining_items = total_items - processed
-                            estimated_remaining_time = (
-                                avg_time_per_item * remaining_items
-                            )
-
-                            # Форматируем время
-                            elapsed_str = format_time(elapsed_time)
-                            remaining_str = format_time(estimated_remaining_time)
-
-                            logger.info(
-                                f"Прогресс: {processed}/{total_items} | "
-                                f"Прошло: {elapsed_str} | "
-                                f"Осталось ~{remaining_str}"
-                            )
-                        else:
-                            logger.info(f"Прогресс: {processed}/{total_items}")
-
                         # Первый элемент в первой секции не должен иметь разрыв страницы
                         is_first_item = section_idx == 0 and item_idx == 0
-                        content = process_item_page(
-                            page, item_url, item_name, is_first_item
-                        )
-                        if content:
-                            content_parts.append(content)
 
-                # Шаг 4: Объединяем все в HTML
+                        tasks.append((task_index, item_url, item_name, is_first_item))
+                        task_index += 1
+
+                # Шаг 4: Параллельная обработка всех элементов
+                start_time = time.time()
+                logger.info(
+                    f"Начинаем параллельную обработку {len(tasks)} элементов..."
+                )
+
+                item_contents = await process_items_parallel(
+                    p, tasks, args.worker_count
+                )
+
+                # Шаг 5: Собираем финальный контент в правильном порядке
+                content_parts = []
+
+                # Добавляем заголовки секций и элементы в правильном порядке
+                current_task_index = 0
+                for section_idx, section in enumerate(sections_to_process):
+                    # Добавляем заголовок секции
+                    section_headers_dict = dict(section_headers)
+                    if section_idx in section_headers_dict:
+                        content_parts.append(section_headers_dict[section_idx])
+
+                    items = section.get("items", [])
+                    if MAX_ITEMS_PER_SECTION:
+                        items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                    else:
+                        items_to_process = items
+
+                    # Добавляем элементы этой секции
+                    for item_idx, item in enumerate(items_to_process):
+                        if current_task_index < len(item_contents):
+                            content = item_contents[current_task_index]
+                            if content:
+                                content_parts.append(content)
+                            current_task_index += 1
+
+                # Шаг 6: Объединяем все в HTML
                 combined_html = combine_html_document(
                     original_styles, toc_html, content_parts
                 )
 
-                # Шаг 5: Сохраняем HTML файл
+                # Шаг 7: Сохраняем HTML файл
                 logger.info(f"Сохранение HTML: {output_html}")
                 with open(output_html, "w", encoding="utf-8") as f:
                     f.write(combined_html)
                 logger.info(f"✅ HTML файл сохранен: {output_html}")
 
-                # Шаг 6: Генерируем PDF (используем существующую страницу)
-                print_combined_pdf(page, combined_html, output_pdf)
+                # Шаг 8: Генерируем PDF (используем существующую страницу)
+                await print_combined_pdf(page, combined_html, output_pdf)
 
                 total_time = time.time() - start_time
                 logger.info("✅ Генерация завершена успешно!")
@@ -1047,7 +1216,12 @@ def main():
         except Exception as e:
             logger.error(f"Критическая ошибка: {e}", exc_info=True)
         finally:
-            browser.close()
+            await browser.close()
+
+
+def main():
+    """Точка входа - запускает async версию"""
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
