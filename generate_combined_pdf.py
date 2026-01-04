@@ -8,9 +8,13 @@ import os
 import re
 import time
 
+import requests
+import urllib3
 from playwright.async_api import async_playwright
 
 from print_with_fix import PRINT_FIX_CSS
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -650,6 +654,184 @@ async def print_toc_only_pdf(page, html_content, output_path):
     logger.info(f"✅ PDF с оглавлением успешно сохранен: {output_path}")
 
 
+async def inline_css_from_html_async(html_content, page):
+    BASE_URL = "https://oracc.museum.upenn.edu"
+
+    link_pattern = re.compile(
+        r'<link\s+[^>]*rel=["\']stylesheet["\'][^>]*href=["\']([^"\']+)["\'][^>]*>',
+        re.IGNORECASE,
+    )
+
+    def load_css(href):
+        if href.startswith("/"):
+            css_url = f"{BASE_URL}{href}"
+        elif href.startswith("http"):
+            css_url = href
+        else:
+            return None
+
+        logger.info(f"Загрузка CSS: {css_url}")
+        try:
+            response = requests.get(css_url, verify=False, timeout=10)
+            if response.status_code == 200:
+                return response.text
+            else:
+                logger.warning(
+                    f"Не удалось загрузить CSS {css_url}: статус {response.status_code}"
+                )
+                return None
+        except Exception as e:
+            logger.warning(f"Ошибка при загрузке CSS {css_url}: {e}")
+            return None
+
+    links = link_pattern.findall(html_content)
+
+    css_contents = {}
+    for href in links:
+        css_content = await asyncio.to_thread(load_css, href)
+        if css_content:
+            css_contents[href] = css_content
+
+    def replace_link(match):
+        href = match.group(1)
+        if href in css_contents:
+            return f"<style>\n{css_contents[href]}\n</style>"
+        return ""
+
+    return link_pattern.sub(replace_link, html_content)
+
+
+async def print_combined_pdf_from_file(page, html_file_path, output_path):
+    logger.info(f"Генерация PDF из файла: {output_path}")
+
+    logger.info(f"Чтение HTML из файла: {html_file_path}")
+    with open(html_file_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+
+    logger.info("Встраивание внешних CSS в HTML...")
+    html_content = await inline_css_from_html_async(html_content, page)
+
+    logger.info("Загрузка HTML в браузер...")
+    await page.set_content(html_content, wait_until="networkidle")
+    await page.wait_for_timeout(2000)
+
+    logger.info("Вычисление номеров страниц для оглавления...")
+    result = await page.evaluate(
+        """
+    () => {
+      const pageHeightPx = 1123;
+      const marginTopPx = 38;
+      const marginBottomPx = 57;
+      const usablePageHeight = pageHeightPx - marginTopPx - marginBottomPx;
+
+      const tocContainer = document.querySelector('.toc-container');
+      const tocHeight = tocContainer ? tocContainer.offsetHeight : 0;
+
+      const contentDiv = document.querySelector('.content');
+      const contentStart = contentDiv ? contentDiv.offsetTop : tocHeight;
+
+      const anchors = {};
+      const allIds = [];
+
+      const allElementsWithId = document.querySelectorAll('*[id]');
+      allElementsWithId.forEach(el => {
+        if (el.id) {
+          allIds.push(el.id);
+        }
+      });
+
+      allElementsWithId.forEach(el => {
+        const id = el.id;
+        if (id && (id.startsWith('section-') || id.startsWith('item-'))) {
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') {
+            return;
+          }
+
+          const rect = el.getBoundingClientRect();
+          if (rect.height === 0 && rect.width === 0) {
+            return;
+          }
+
+          const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+          const absoluteTop = rect.top + scrollTop;
+
+          const positionFromContentStart = absoluteTop - contentStart;
+
+          let pageNum = 2;
+          if (positionFromContentStart > 0) {
+            pageNum = 2 + Math.floor(positionFromContentStart / usablePageHeight);
+          } else if (positionFromContentStart <= 0 && absoluteTop < contentStart) {
+            pageNum = 1;
+          }
+
+          anchors[id] = pageNum;
+        }
+      });
+
+      let updatedCount = 0;
+      let notFoundCount = 0;
+      const notFoundAnchors = [];
+
+      document.querySelectorAll('.toc-page').forEach(span => {
+        const link = span.closest('a');
+        if (link) {
+          const href = link.getAttribute('href');
+          if (href && href.startsWith('#')) {
+            const anchorId = href.substring(1);
+            const pageNum = anchors[anchorId];
+            if (pageNum) {
+              span.textContent = pageNum;
+              span.style.display = 'inline';
+              span.style.visibility = 'visible';
+              updatedCount++;
+            } else {
+              notFoundAnchors.push(anchorId);
+              notFoundCount++;
+              span.textContent = '';
+              span.style.display = 'none';
+            }
+          }
+        }
+      });
+
+      if (notFoundAnchors.length > 0) {
+        console.warn('Не найдены якоря:', notFoundAnchors.slice(0, 5));
+      }
+      return {
+        totalAnchors: Object.keys(anchors).length,
+        updated: updatedCount,
+        notFound: notFoundCount,
+        notFoundAnchors: notFoundAnchors.slice(0, 10),
+        foundAnchors: Object.keys(anchors).slice(0, 10),
+        allIds: allIds.filter(id => id.startsWith('item-') || id.startsWith('section-')).slice(0, 10)
+      };
+    }
+    """
+    )
+
+    if result:
+        logger.info(
+            f"Найдено якорей: {result.get('totalAnchors', 0)}, обновлено номеров страниц: {result.get('updated', 0)}"
+        )
+        if result.get("notFound", 0) > 0:
+            logger.warning(
+                f"Не найдено якорей для {result.get('notFound', 0)} элементов (возможно, они не обрабатываются)"
+            )
+
+    await page.wait_for_timeout(500)
+
+    await page.pdf(
+        path=output_path,
+        format="A4",
+        margin={"top": "1cm", "right": "0.8cm", "bottom": "1.5cm", "left": "0.8cm"},
+        print_background=False,
+        prefer_css_page_size=True,
+    )
+
+    logger.info(f"✅ PDF успешно сохранен: {output_path}")
+
+
 async def print_combined_pdf(page, html_content, output_path):
     logger.info(f"Генерация PDF: {output_path}")
 
@@ -898,11 +1080,49 @@ def parse_arguments():
         default=20,
         help="Количество параллельных воркеров (браузеров) для обработки страниц (по умолчанию: 10)",
     )
+    parser.add_argument(
+        "--html-to-pdf-only",
+        action="store_true",
+        help="Только конвертировать существующий HTML файл в PDF (без генерации HTML)",
+    )
+    parser.add_argument(
+        "--source-html",
+        type=str,
+        default="combined_document.html",
+        help="Путь к исходному HTML файлу для конвертации в PDF (по умолчанию: combined_document.html). Используется только с --html-to-pdf-only",
+    )
     return parser.parse_args()
 
 
 async def main_async():
     args = parse_arguments()
+
+    if args.html_to_pdf_only:
+        source_html = args.source_html
+        if not os.path.exists(source_html):
+            logger.error(f"Исходный HTML файл не найден: {source_html}")
+            return
+
+        default_pdf = "combined_document.pdf"
+        output_pdf = args.target_pdf if args.target_pdf is not None else default_pdf
+
+        logger.info("Режим: конвертация HTML в PDF")
+        logger.info(f"Исходный HTML: {source_html}")
+        logger.info(f"Выходной PDF: {output_pdf}")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            try:
+                await print_combined_pdf_from_file(page, source_html, output_pdf)
+                logger.info("✅ Конвертация HTML в PDF завершена успешно!")
+            except Exception as e:
+                logger.error(f"Критическая ошибка при конвертации: {e}", exc_info=True)
+            finally:
+                await browser.close()
+
+        return
 
     if args.table_of_content_only:
         default_html = "table_of_content.html"
