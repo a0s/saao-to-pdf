@@ -779,6 +779,230 @@ async def merge_pdf_files(pdf_paths, output_path):
         raise
 
 
+def build_anchor_map_from_chunk_schemas(section_chunks, chunk_pdf_paths, chunks_dir):
+    """
+    Строит общую карту якорей из JSON схем чанков с учетом смещений страниц.
+
+    Args:
+        section_chunks: Список списков секций (чанки)
+        chunk_pdf_paths: Список путей к PDF чанкам
+        chunks_dir: Папка с чанками
+
+    Returns:
+        Словарь {anchor_id: page_number} (номера страниц в merged_content.pdf, без учета TOC)
+    """
+    logger.info("Построение карты якорей из схем чанков...")
+
+    anchor_page_map = {}
+    current_page = 1
+
+    for chunk_idx, chunk_pdf_path in enumerate(chunk_pdf_paths):
+        chunk_schema_path = os.path.join(
+            chunks_dir,
+            f"combined_document_part_{chunk_idx + 1:03d}_anchors.json",
+        )
+
+        if not os.path.exists(chunk_schema_path):
+            logger.warning(
+                f"Схема для чанка {chunk_idx + 1} не найдена: {chunk_schema_path}, используем fallback"
+            )
+            if os.path.exists(chunk_pdf_path):
+                try:
+                    chunk_reader = PdfReader(chunk_pdf_path)
+                    chunk_pages = len(chunk_reader.pages)
+                    current_page += chunk_pages
+                except Exception as e:
+                    logger.warning(f"Ошибка при чтении чанка {chunk_idx + 1}: {e}")
+            continue
+
+        try:
+            with open(chunk_schema_path, "r", encoding="utf-8") as f:
+                chunk_schema = json.load(f)
+
+            anchors_in_chunk = chunk_schema.get("anchors", {})
+            chunk_pages = chunk_schema.get("total_pages", 1)
+
+            logger.info(
+                f"  Чанк {chunk_idx + 1}: {chunk_pages} страниц, начинается со страницы {current_page}, найдено {len(anchors_in_chunk)} якорей"
+            )
+
+            for anchor_id, page_in_chunk in anchors_in_chunk.items():
+                absolute_page = current_page + page_in_chunk - 1
+                anchor_page_map[anchor_id] = absolute_page
+
+            current_page += chunk_pages
+
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке схемы чанка {chunk_idx + 1}: {e}")
+            if os.path.exists(chunk_pdf_path):
+                try:
+                    chunk_reader = PdfReader(chunk_pdf_path)
+                    chunk_pages = len(chunk_reader.pages)
+                    current_page += chunk_pages
+                except Exception:
+                    pass
+            continue
+
+    logger.info(f"Построена карта для {len(anchor_page_map)} якорей")
+    return anchor_page_map
+
+
+def calculate_anchor_positions_from_chunks(
+    section_chunks, sections_to_process, chunk_pdf_paths, chunks_dir
+):
+    """
+    Вычисляет позиции якорей на основе структуры чанков.
+    Использует накопительный счетчик страниц при склеивании и отслеживает позиции якорей внутри каждого чанка.
+
+    Args:
+        section_chunks: Список списков секций (чанки)
+        sections_to_process: Все секции для обработки
+        chunk_pdf_paths: Список путей к PDF чанкам
+        chunks_dir: Папка с чанками
+
+    Returns:
+        Словарь {anchor_id: page_number} (номера страниц в merged_content.pdf, без учета TOC)
+    """
+    logger.info("Вычисление позиций якорей из структуры чанков...")
+
+    anchor_page_map = {}
+    chunk_start_pages = {}
+    current_page = 1
+
+    for chunk_idx, chunk_pdf_path in enumerate(chunk_pdf_paths):
+        if not os.path.exists(chunk_pdf_path):
+            logger.warning(f"Чанк {chunk_idx + 1} не найден: {chunk_pdf_path}")
+            continue
+
+        try:
+            chunk_reader = PdfReader(chunk_pdf_path)
+            chunk_pages = len(chunk_reader.pages)
+
+            chunk_start_pages[chunk_idx] = current_page
+            logger.info(
+                f"  Чанк {chunk_idx + 1}: {chunk_pages} страниц, начинается со страницы {current_page}"
+            )
+
+            section_chunk = (
+                section_chunks[chunk_idx] if chunk_idx < len(section_chunks) else []
+            )
+
+            section_start_idx = 0
+            for prev_chunk_idx in range(chunk_idx):
+                if prev_chunk_idx < len(section_chunks):
+                    section_start_idx += len(section_chunks[prev_chunk_idx])
+
+            anchors_found_in_chunk = 0
+            chunk_text_by_page = {}
+
+            for page_num, page in enumerate(chunk_reader.pages, start=1):
+                try:
+                    text = page.extract_text()
+                    chunk_text_by_page[page_num] = text.lower()
+                except Exception as e:
+                    logger.debug(
+                        f"Ошибка при извлечении текста со страницы {page_num} чанка {chunk_idx + 1}: {e}"
+                    )
+
+            for section_idx, section in enumerate(section_chunk):
+                original_section_idx = section_start_idx + section_idx
+                section_anchor = f"section-{original_section_idx}"
+                section_name = section.get("section_name", "").lower()
+
+                for page_num, page_text in chunk_text_by_page.items():
+                    if section_anchor not in anchor_page_map:
+                        if section_anchor in page_text or (
+                            section_name and section_name in page_text
+                        ):
+                            absolute_page = current_page + page_num - 1
+                            anchor_page_map[section_anchor] = absolute_page
+                            anchors_found_in_chunk += 1
+                            break
+
+                items = section.get("items", [])
+                if MAX_ITEMS_PER_SECTION:
+                    items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                else:
+                    items_to_process = items
+
+                for item in items_to_process:
+                    item_name = item.get("item_name", "").lower()
+                    item_anchor = generate_anchor_id(item.get("item_name", ""), "item")
+
+                    for page_num, page_text in chunk_text_by_page.items():
+                        if item_anchor not in anchor_page_map:
+                            item_anchor_lower = item_anchor.lower()
+                            if item_anchor_lower in page_text or (
+                                item_name and item_name in page_text
+                            ):
+                                absolute_page = current_page + page_num - 1
+                                anchor_page_map[item_anchor] = absolute_page
+                                anchors_found_in_chunk += 1
+                                break
+
+            if anchors_found_in_chunk == 0:
+                logger.warning(
+                    f"    Не найдено якорей в PDF чанка {chunk_idx + 1}, используем пропорциональное распределение"
+                )
+                total_elements_in_chunk = 0
+                for section in section_chunk:
+                    total_elements_in_chunk += 1
+                    items = section.get("items", [])
+                    if MAX_ITEMS_PER_SECTION:
+                        total_elements_in_chunk += min(
+                            len(items), MAX_ITEMS_PER_SECTION
+                        )
+                    else:
+                        total_elements_in_chunk += len(items)
+
+                if total_elements_in_chunk > 0:
+                    elements_per_page = max(1, total_elements_in_chunk / chunk_pages)
+                    current_element = 0
+
+                    for section_idx, section in enumerate(section_chunk):
+                        original_section_idx = section_start_idx + section_idx
+                        section_anchor = f"section-{original_section_idx}"
+
+                        if section_anchor not in anchor_page_map:
+                            page_in_chunk = 1 + int(current_element / elements_per_page)
+                            page_in_chunk = min(max(page_in_chunk, 1), chunk_pages)
+                            absolute_page = current_page + page_in_chunk - 1
+                            anchor_page_map[section_anchor] = absolute_page
+                        current_element += 1
+
+                        items = section.get("items", [])
+                        if MAX_ITEMS_PER_SECTION:
+                            items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                        else:
+                            items_to_process = items
+
+                        for item in items_to_process:
+                            item_name = item.get("item_name", "")
+                            item_anchor = generate_anchor_id(item_name, "item")
+
+                            if item_anchor not in anchor_page_map:
+                                page_in_chunk = 1 + int(
+                                    current_element / elements_per_page
+                                )
+                                page_in_chunk = min(max(page_in_chunk, 1), chunk_pages)
+                                absolute_page = current_page + page_in_chunk - 1
+                                anchor_page_map[item_anchor] = absolute_page
+                            current_element += 1
+            else:
+                logger.info(
+                    f"    Найдено {anchors_found_in_chunk} якорей в PDF чанка {chunk_idx + 1}"
+                )
+
+            current_page += chunk_pages
+
+        except Exception as e:
+            logger.warning(f"Ошибка при чтении чанка {chunk_idx + 1}: {e}")
+            continue
+
+    logger.info(f"Вычислено позиций для {len(anchor_page_map)} якорей")
+    return anchor_page_map
+
+
 async def extract_anchors_from_pdf_using_playwright(page):
     """
     Извлекает якоря и их номера страниц из загруженного HTML используя Playwright.
@@ -839,6 +1063,141 @@ async def extract_anchors_from_pdf_using_playwright(page):
     except Exception as e:
         logger.error(f"Ошибка при вычислении позиций якорей: {e}", exc_info=True)
         return {}
+
+
+async def extract_anchor_positions_from_chunk_html(
+    page, chunk_html, section_chunk, sections_to_process
+):
+    """
+    Извлекает позиции якорей из HTML чанка используя JavaScript для вычисления номеров страниц.
+
+    Args:
+        page: Playwright page объект
+        chunk_html: HTML содержимое чанка
+        section_chunk: Список секций в этом чанке
+        sections_to_process: Все секции для обработки (для вычисления правильных индексов)
+
+    Returns:
+        Словарь с информацией о якорях:
+        {
+            "chunk_index": int,
+            "total_pages": int,
+            "anchors": {anchor_id: page_number_in_chunk},
+            "sections": [
+                {
+                    "section_index": int,
+                    "section_anchor": str,
+                    "page": int,
+                    "items": [
+                        {"item_anchor": str, "page": int}
+                    ]
+                }
+            ]
+        }
+    """
+    logger.info("Извлечение позиций якорей из HTML чанка...")
+
+    await page.set_content(chunk_html, wait_until="networkidle")
+    await page.wait_for_timeout(2000)
+
+    try:
+        result = await page.evaluate(
+            """
+        () => {
+          const pageHeightPx = 1123;
+          const marginTopPx = 38;
+          const marginBottomPx = 57;
+          const usablePageHeight = pageHeightPx - marginTopPx - marginBottomPx;
+
+          const anchors = {};
+          const allElementsWithId = document.querySelectorAll('*[id]');
+
+          allElementsWithId.forEach(el => {
+            const id = el.id;
+            if (id && (id.startsWith('section-') || id.startsWith('item-'))) {
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') {
+                return;
+              }
+
+              const rect = el.getBoundingClientRect();
+              if (rect.height === 0 && rect.width === 0) {
+                return;
+              }
+
+              const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+              const absoluteTop = rect.top + scrollTop;
+
+              const pageNum = 1 + Math.floor(absoluteTop / usablePageHeight);
+              anchors[id] = pageNum;
+            }
+          });
+
+          const bodyHeight = document.body.scrollHeight;
+          const totalPages = Math.max(1, Math.ceil(bodyHeight / usablePageHeight));
+
+          return {
+            anchors: anchors,
+            totalPages: totalPages
+          };
+        }
+        """
+        )
+
+        anchors_map = result.get("anchors", {})
+        total_pages = result.get("totalPages", 1)
+
+        section_start_idx = 0
+        for section in sections_to_process:
+            if section in section_chunk:
+                break
+            section_start_idx += 1
+
+        sections_data = []
+        for section_idx, section in enumerate(section_chunk):
+            original_section_idx = section_start_idx + section_idx
+            section_anchor = f"section-{original_section_idx}"
+            section_page = anchors_map.get(section_anchor, 1)
+
+            items_data = []
+            items = section.get("items", [])
+            if MAX_ITEMS_PER_SECTION:
+                items_to_process = items[:MAX_ITEMS_PER_SECTION]
+            else:
+                items_to_process = items
+
+            for item in items_to_process:
+                item_name = item.get("item_name", "")
+                item_anchor = generate_anchor_id(item_name, "item")
+                item_page = anchors_map.get(item_anchor)
+                if item_page:
+                    items_data.append({"item_anchor": item_anchor, "page": item_page})
+
+            sections_data.append(
+                {
+                    "section_index": original_section_idx,
+                    "section_anchor": section_anchor,
+                    "page": section_page,
+                    "items": items_data,
+                }
+            )
+
+        schema = {
+            "anchors": anchors_map,
+            "total_pages": total_pages,
+            "sections": sections_data,
+        }
+
+        logger.info(
+            f"Найдено {len(anchors_map)} якорей в чанке, всего страниц: {total_pages}"
+        )
+        return schema
+
+    except Exception as e:
+        logger.error(
+            f"Ошибка при извлечении позиций якорей из чанка: {e}", exc_info=True
+        )
+        return {"anchors": {}, "total_pages": 1, "sections": []}
 
 
 async def extract_anchors_from_pdf(pdf_path):
@@ -1030,42 +1389,46 @@ async def add_internal_links_to_pdf(pdf_path, anchor_page_map, toc_pages_count):
 
 
 async def replace_toc_pages_in_pdf(
-    toc_pdf_path, merged_pdf_path, output_path, toc_pages_count, anchor_page_map
+    toc_pdf_path, content_pdf_path, output_path, toc_pages_count, anchor_page_map
 ):
     """
-    Заменяет страницы оглавления в объединенном PDF обновленным оглавлением
-    и добавляет внутренние ссылки.
+    Склеивает оглавление и контент, добавляет named destinations для якорей
+    и создает ссылки в оглавлении.
 
     Args:
-        toc_pdf_path: Путь к обновленному PDF оглавления
-        merged_pdf_path: Путь к объединенному PDF (оглавление + контент)
+        toc_pdf_path: Путь к PDF оглавления
+        content_pdf_path: Путь к PDF контента
         output_path: Путь к финальному PDF
-        toc_pages_count: Количество страниц оглавления для замены
-        anchor_page_map: Словарь {anchor_id: page_number} для создания ссылок
+        toc_pages_count: Количество страниц оглавления
+        anchor_page_map: Словарь {anchor_id: page_number} (номера страниц с учетом TOC)
     """
-    logger.info(f"Замена {toc_pages_count} страниц оглавления в финальном PDF...")
+    logger.info("Склеивание оглавления и контента с добавлением ссылок...")
 
     try:
         toc_reader = PdfReader(toc_pdf_path)
-        merged_reader = PdfReader(merged_pdf_path)
+        content_reader = PdfReader(content_pdf_path)
 
         writer = PdfWriter()
 
-        for i, page in enumerate(toc_reader.pages):
+        for page in toc_reader.pages:
             writer.add_page(page)
 
-        for i in range(toc_pages_count, len(merged_reader.pages)):
-            writer.add_page(merged_reader.pages[i])
+        for page in content_reader.pages:
+            writer.add_page(page)
 
-        logger.info("Добавление destinations для якорей...")
+        logger.info("Добавление named destinations для якорей...")
+        destinations_added = 0
         for anchor_id, page_num in anchor_page_map.items():
             if page_num > 0 and page_num <= len(writer.pages):
                 try:
                     writer.add_named_destination(anchor_id, page_num - 1)
+                    destinations_added += 1
                 except Exception as e:
                     logger.debug(f"Не удалось добавить destination {anchor_id}: {e}")
+        logger.info(f"Добавлено {destinations_added} named destinations")
 
         logger.info("Добавление ссылок в оглавление...")
+        links_added = 0
         for toc_page_idx in range(min(toc_pages_count, len(toc_reader.pages))):
             try:
                 toc_page = toc_reader.pages[toc_page_idx]
@@ -1087,7 +1450,15 @@ async def replace_toc_pages_in_pdf(
                             try:
                                 from pypdf.generic import RectangleObject
 
-                                rect = RectangleObject([0, 0, 1000, 1000])
+                                page_rect = toc_page.mediabox
+                                rect = RectangleObject(
+                                    [
+                                        float(page_rect.left),
+                                        float(page_rect.bottom),
+                                        float(page_rect.right),
+                                        float(page_rect.top),
+                                    ]
+                                )
                                 writer.add_link(
                                     toc_page_idx,
                                     target_page_num - 1,
@@ -1095,6 +1466,7 @@ async def replace_toc_pages_in_pdf(
                                     border=None,
                                     fit="/Fit",
                                 )
+                                links_added += 1
                                 logger.debug(
                                     f"  Добавлена ссылка: {anchor_id} (страница {toc_page_idx + 1} -> {target_page_num})"
                                 )
@@ -1107,13 +1479,15 @@ async def replace_toc_pages_in_pdf(
                     f"Ошибка при обработке страницы оглавления {toc_page_idx + 1}: {e}"
                 )
 
+        logger.info(f"Добавлено {links_added} ссылок в оглавление")
+
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
 
-        logger.info(f"✅ Оглавление успешно заменено в финальном PDF: {output_path}")
+        logger.info(f"✅ Финальный PDF с ссылками сохранен: {output_path}")
 
     except Exception as e:
-        logger.error(f"Ошибка при замене страниц оглавления: {e}", exc_info=True)
+        logger.error(f"Ошибка при склеивании PDF: {e}", exc_info=True)
         raise
 
 
@@ -1582,11 +1956,6 @@ def parse_arguments():
         default=1,
         help="Количество секций в одной части при использовании --solution-chunk-by-sections (по умолчанию: 1)",
     )
-    parser.add_argument(
-        "--skip-chunk-download",
-        action="store_true",
-        help="Пропустить этап скачивания и генерации чанков (использовать существующие чанки в chunks/)",
-    )
     return parser.parse_args()
 
 
@@ -1736,326 +2105,224 @@ async def main_async():
 
                 chunk_pdf_paths = []
 
-                if args.skip_chunk_download:
-                    logger.info(
-                        "Пропуск этапа скачивания чанков (--skip-chunk-download)"
+                for chunk_idx, section_chunk in enumerate(section_chunks):
+                    chunk_pdf_path = os.path.join(
+                        chunks_dir,
+                        f"combined_document_part_{chunk_idx + 1:03d}.pdf",
                     )
-                    for chunk_idx in range(len(section_chunks)):
-                        chunk_pdf_path = os.path.join(
-                            chunks_dir,
-                            f"combined_document_part_{chunk_idx + 1:03d}.pdf",
+
+                    if os.path.exists(chunk_pdf_path):
+                        chunk_reader = PdfReader(chunk_pdf_path)
+                        logger.info(
+                            f"  Чанк {chunk_idx + 1} уже существует: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц), пропускаем генерацию"
                         )
-                        if os.path.exists(chunk_pdf_path):
-                            chunk_reader = PdfReader(chunk_pdf_path)
-                            logger.info(
-                                f"  Найден существующий чанк {chunk_idx + 1}: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
-                            )
-                            chunk_pdf_paths.append(chunk_pdf_path)
+                        chunk_pdf_paths.append(chunk_pdf_path)
+                        continue
+
+                    logger.info(
+                        f"Обработка части {chunk_idx + 1}/{len(section_chunks)} ({len(section_chunk)} секций)"
+                    )
+
+                    tasks = []
+                    section_headers = []
+
+                    task_index = 0
+                    for section_idx, section in enumerate(section_chunk):
+                        section_name = section.get("section_name", "")
+                        logger.info(f"  Подготовка секции: {section_name}")
+
+                        original_section_idx = sections_to_process.index(section)
+                        section_anchor = f"section-{original_section_idx}"
+
+                        if section_idx > 0:
+                            page_break = "page-break-before: always !important;"
                         else:
-                            logger.warning(
-                                f"  Чанк {chunk_idx + 1} не найден: {chunk_pdf_path}"
+                            page_break = "page-break-before: auto;"
+                        section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
+                        section_headers.append((section_idx, section_header))
+
+                        items = section.get("items", [])
+                        if MAX_ITEMS_PER_SECTION:
+                            items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                        else:
+                            items_to_process = items
+
+                        for item_idx, item in enumerate(items_to_process):
+                            item_name = item.get("item_name", "")
+                            item_url = item.get("item_href", "")
+
+                            is_first_item = (
+                                chunk_idx == 0 and section_idx == 0 and item_idx == 0
                             )
 
-                    if not chunk_pdf_paths:
+                            tasks.append(
+                                (task_index, item_url, item_name, is_first_item)
+                            )
+                            task_index += 1
+
+                    if not tasks:
+                        logger.warning(
+                            f"Нет задач для части {chunk_idx + 1}, пропускаем"
+                        )
+                        continue
+
+                    start_time_chunk = time.time()
+                    logger.info(
+                        f"  Начинаем параллельную обработку {len(tasks)} элементов..."
+                    )
+
+                    item_contents = await process_items_parallel(
+                        p, tasks, args.worker_count
+                    )
+
+                    content_parts = []
+
+                    current_task_index = 0
+                    for section_idx, section in enumerate(section_chunk):
+                        section_headers_dict = dict(section_headers)
+                        if section_idx in section_headers_dict:
+                            content_parts.append(section_headers_dict[section_idx])
+
+                        items = section.get("items", [])
+                        if MAX_ITEMS_PER_SECTION:
+                            items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                        else:
+                            items_to_process = items
+
+                        for item_idx, item in enumerate(items_to_process):
+                            if current_task_index < len(item_contents):
+                                content = item_contents[current_task_index]
+                                if content:
+                                    content_parts.append(content)
+                                current_task_index += 1
+
+                    chunk_html = combine_html_content_only(
+                        original_styles, content_parts
+                    )
+
+                    chunk_html_path = os.path.join(
+                        chunks_dir,
+                        f"combined_document_part_{chunk_idx + 1:03d}.html",
+                    )
+                    with open(chunk_html_path, "w", encoding="utf-8") as f:
+                        f.write(chunk_html)
+
+                    chunk_schema_path = os.path.join(
+                        chunks_dir,
+                        f"combined_document_part_{chunk_idx + 1:03d}_anchors.json",
+                    )
+
+                    try:
+                        await page.set_content(chunk_html, wait_until="networkidle")
+                        await page.wait_for_timeout(2000)
+
+                        logger.info(
+                            f"  Извлечение позиций якорей для части {chunk_idx + 1}..."
+                        )
+                        chunk_schema = await extract_anchor_positions_from_chunk_html(
+                            page, chunk_html, section_chunk, sections_to_process
+                        )
+                        chunk_schema["chunk_index"] = chunk_idx
+
+                        with open(chunk_schema_path, "w", encoding="utf-8") as f:
+                            json.dump(chunk_schema, f, ensure_ascii=False, indent=2)
+                        logger.info(f"  Схема якорей сохранена: {chunk_schema_path}")
+
+                        await page.pdf(
+                            path=chunk_pdf_path,
+                            format="A4",
+                            margin={
+                                "top": "1cm",
+                                "right": "0.8cm",
+                                "bottom": "1.5cm",
+                                "left": "0.8cm",
+                            },
+                            print_background=False,
+                            prefer_css_page_size=True,
+                        )
+
+                        chunk_reader = PdfReader(chunk_pdf_path)
+                        logger.info(
+                            f"  ✅ Часть {chunk_idx + 1} сохранена: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
+                        )
+                        chunk_pdf_paths.append(chunk_pdf_path)
+
+                        chunk_time = time.time() - start_time_chunk
+                        logger.info(
+                            f"  ⏱️  Время обработки части: {format_time(chunk_time)}"
+                        )
+                    except Exception as e:
                         logger.error(
-                            "Не найдено существующих чанков. Убедитесь, что они находятся в папке chunks/"
+                            f"Ошибка при генерации части {chunk_idx + 1}: {e}",
+                            exc_info=True,
                         )
-                        return
-                else:
-                    for chunk_idx, section_chunk in enumerate(section_chunks):
-                        logger.info(
-                            f"Обработка части {chunk_idx + 1}/{len(section_chunks)} ({len(section_chunk)} секций)"
-                        )
-
-                        tasks = []
-                        section_headers = []
-
-                        task_index = 0
-                        for section_idx, section in enumerate(section_chunk):
-                            section_name = section.get("section_name", "")
-                            logger.info(f"  Подготовка секции: {section_name}")
-
-                            original_section_idx = sections_to_process.index(section)
-                            section_anchor = f"section-{original_section_idx}"
-
-                            if section_idx > 0:
-                                page_break = "page-break-before: always !important;"
-                            else:
-                                page_break = "page-break-before: auto;"
-                            section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
-                            section_headers.append((section_idx, section_header))
-
-                            items = section.get("items", [])
-                            if MAX_ITEMS_PER_SECTION:
-                                items_to_process = items[:MAX_ITEMS_PER_SECTION]
-                            else:
-                                items_to_process = items
-
-                            for item_idx, item in enumerate(items_to_process):
-                                item_name = item.get("item_name", "")
-                                item_url = item.get("item_href", "")
-
-                                is_first_item = (
-                                    chunk_idx == 0
-                                    and section_idx == 0
-                                    and item_idx == 0
-                                )
-
-                                tasks.append(
-                                    (task_index, item_url, item_name, is_first_item)
-                                )
-                                task_index += 1
-
-                        if not tasks:
-                            logger.warning(
-                                f"Нет задач для части {chunk_idx + 1}, пропускаем"
-                            )
-                            continue
-
-                        start_time_chunk = time.time()
-                        logger.info(
-                            f"  Начинаем параллельную обработку {len(tasks)} элементов..."
-                        )
-
-                        item_contents = await process_items_parallel(
-                            p, tasks, args.worker_count
-                        )
-
-                        content_parts = []
-
-                        current_task_index = 0
-                        for section_idx, section in enumerate(section_chunk):
-                            section_headers_dict = dict(section_headers)
-                            if section_idx in section_headers_dict:
-                                content_parts.append(section_headers_dict[section_idx])
-
-                            items = section.get("items", [])
-                            if MAX_ITEMS_PER_SECTION:
-                                items_to_process = items[:MAX_ITEMS_PER_SECTION]
-                            else:
-                                items_to_process = items
-
-                            for item_idx, item in enumerate(items_to_process):
-                                if current_task_index < len(item_contents):
-                                    content = item_contents[current_task_index]
-                                    if content:
-                                        content_parts.append(content)
-                                    current_task_index += 1
-
-                        chunk_html = combine_html_content_only(
-                            original_styles, content_parts
-                        )
-
-                        chunk_html_path = os.path.join(
-                            chunks_dir,
-                            f"combined_document_part_{chunk_idx + 1:03d}.html",
-                        )
-                        with open(chunk_html_path, "w", encoding="utf-8") as f:
-                            f.write(chunk_html)
-
-                        chunk_pdf_path = os.path.join(
-                            chunks_dir,
-                            f"combined_document_part_{chunk_idx + 1:03d}.pdf",
-                        )
-
-                        try:
-                            await page.set_content(chunk_html, wait_until="networkidle")
-                            await page.wait_for_timeout(2000)
-
-                            await page.pdf(
-                                path=chunk_pdf_path,
-                                format="A4",
-                                margin={
-                                    "top": "1cm",
-                                    "right": "0.8cm",
-                                    "bottom": "1.5cm",
-                                    "left": "0.8cm",
-                                },
-                                print_background=False,
-                                prefer_css_page_size=True,
-                            )
-
-                            chunk_reader = PdfReader(chunk_pdf_path)
-                            logger.info(
-                                f"  ✅ Часть {chunk_idx + 1} сохранена: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
-                            )
-                            chunk_pdf_paths.append(chunk_pdf_path)
-
-                            chunk_time = time.time() - start_time_chunk
-                            logger.info(
-                                f"  ⏱️  Время обработки части: {format_time(chunk_time)}"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Ошибка при генерации части {chunk_idx + 1}: {e}",
-                                exc_info=True,
-                            )
-                            logger.warning(
-                                f"Пропускаем часть {chunk_idx + 1} и продолжаем"
-                            )
+                        logger.warning(f"Пропускаем часть {chunk_idx + 1} и продолжаем")
 
                 if not chunk_pdf_paths:
                     logger.error("Не удалось сгенерировать ни одной части")
                     return
 
-                logger.info("Генерация оглавления после скачивания чанков...")
-                toc_html = generate_toc_html(sections_to_process)
+                logger.info("Склеивание всех частей контента...")
+                merged_content_pdf = os.path.join(chunks_dir, "merged_content.pdf")
+                await merge_pdf_files(chunk_pdf_paths, merged_content_pdf)
 
-                toc_html_doc = combine_html_document(
+                logger.info("Построение карты якорей из схем чанков...")
+                anchor_page_map_content = build_anchor_map_from_chunk_schemas(
+                    section_chunks, chunk_pdf_paths, chunks_dir
+                )
+
+                logger.info(
+                    "Генерация временного оглавления для определения размера..."
+                )
+                toc_html = generate_toc_html(sections_to_process)
+                toc_html_doc_temp = combine_html_document(
                     original_styles="",
                     toc_html=toc_html,
                     content_parts=[],
                     toc_only=True,
                 )
 
-                toc_pdf_path = os.path.join(chunks_dir, "toc.pdf")
-                await print_toc_only_pdf(page, toc_html_doc, toc_pdf_path)
+                toc_pdf_path_temp = os.path.join(chunks_dir, "toc_temp.pdf")
+                await print_toc_only_pdf(page, toc_html_doc_temp, toc_pdf_path_temp)
 
-                toc_reader = PdfReader(toc_pdf_path)
+                toc_reader = PdfReader(toc_pdf_path_temp)
                 toc_pages_count = len(toc_reader.pages)
                 logger.info(f"Оглавление занимает {toc_pages_count} страниц")
 
-                logger.info("Склеивание всех частей контента...")
-                merged_content_pdf = os.path.join(chunks_dir, "merged_content.pdf")
-                await merge_pdf_files(chunk_pdf_paths, merged_content_pdf)
-
-                logger.info("Склеивание оглавления и контента...")
-                merged_pdf_path = os.path.join(chunks_dir, "merged_with_toc.pdf")
-                await merge_pdf_files(
-                    [toc_pdf_path, merged_content_pdf], merged_pdf_path
-                )
-
                 logger.info(
-                    "Создание объединенного HTML для вычисления позиций якорей..."
+                    "Вычисление финальных позиций якорей с учетом смещения TOC..."
                 )
-                all_content_parts = []
-                for chunk_idx in range(len(section_chunks)):
-                    chunk_html_path = os.path.join(
-                        chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.html"
-                    )
-                    if os.path.exists(chunk_html_path):
-                        try:
-                            with open(chunk_html_path, "r", encoding="utf-8") as f:
-                                chunk_html = f.read()
-                                content_match = re.search(
-                                    r'<div class="content">(.*?)</div>\s*</body>',
-                                    chunk_html,
-                                    re.DOTALL,
-                                )
-                                if content_match:
-                                    all_content_parts.append(content_match.group(1))
-                        except Exception as e:
-                            logger.warning(f"Ошибка при чтении {chunk_html_path}: {e}")
-
-                if not all_content_parts:
-                    logger.warning(
-                        "Не удалось собрать HTML части, используем упрощенный метод извлечения якорей"
-                    )
-                    anchor_page_map = await extract_anchors_from_pdf(merged_pdf_path)
-                else:
-                    merged_content_html = combine_html_content_only(
-                        original_styles, all_content_parts
-                    )
-                    merged_html_path = os.path.join(chunks_dir, "merged_content.html")
-                    with open(merged_html_path, "w", encoding="utf-8") as f:
-                        f.write(merged_content_html)
-
-                    logger.info(
-                        "Загрузка HTML в браузер для вычисления позиций якорей..."
-                    )
-                    await page.set_content(
-                        merged_content_html, wait_until="networkidle"
-                    )
-                    await page.wait_for_timeout(2000)
-
-                    logger.info("Вычисление позиций якорей...")
-                    anchor_page_map = await extract_anchors_from_pdf_using_playwright(
-                        page
-                    )
-
-                    for anchor_id in anchor_page_map:
-                        anchor_page_map[anchor_id] += toc_pages_count
+                anchor_page_map_final = {}
+                for anchor_id, page_num in anchor_page_map_content.items():
+                    anchor_page_map_final[anchor_id] = page_num + toc_pages_count
 
                 logger.info("Обновление номеров страниц в оглавлении...")
                 updated_toc_html = await update_toc_page_numbers(
-                    page, toc_html, anchor_page_map, toc_pages_count
+                    page, toc_html, anchor_page_map_final, toc_pages_count
+                )
+
+                toc_html_doc_final = combine_html_document(
+                    original_styles="",
+                    toc_html=updated_toc_html,
+                    content_parts=[],
+                    toc_only=True,
+                )
+
+                toc_pdf_path = os.path.join(chunks_dir, "toc.pdf")
+                await print_toc_only_pdf(page, toc_html_doc_final, toc_pdf_path)
+
+                logger.info("Склеивание оглавления и контента с добавлением ссылок...")
+                await replace_toc_pages_in_pdf(
+                    toc_pdf_path,
+                    merged_content_pdf,
+                    output_pdf,
+                    toc_pages_count,
+                    anchor_page_map_final,
                 )
 
                 logger.info(
-                    "Создание финального HTML с обновленным оглавлением и контентом..."
+                    f"✅ Финальный PDF с рабочими ссылками сохранен: {output_pdf}"
                 )
-                all_content_parts_final = []
-                for chunk_idx in range(len(section_chunks)):
-                    chunk_html_path = os.path.join(
-                        chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.html"
-                    )
-                    if os.path.exists(chunk_html_path):
-                        try:
-                            with open(chunk_html_path, "r", encoding="utf-8") as f:
-                                chunk_html = f.read()
-                                content_match = re.search(
-                                    r'<div class="content">(.*?)</div>\s*</body>',
-                                    chunk_html,
-                                    re.DOTALL,
-                                )
-                                if content_match:
-                                    all_content_parts_final.append(
-                                        content_match.group(1)
-                                    )
-                        except Exception as e:
-                            logger.warning(f"Ошибка при чтении {chunk_html_path}: {e}")
-
-                if all_content_parts_final:
-                    final_html = combine_html_document(
-                        original_styles, updated_toc_html, all_content_parts_final
-                    )
-                    final_html_path = os.path.join(chunks_dir, "final_document.html")
-                    with open(final_html_path, "w", encoding="utf-8") as f:
-                        f.write(final_html)
-
-                    logger.info("Генерация финального PDF с рабочими ссылками...")
-                    await page.set_content(final_html, wait_until="networkidle")
-                    await page.wait_for_timeout(2000)
-
-                    await page.pdf(
-                        path=output_pdf,
-                        format="A4",
-                        margin={
-                            "top": "1cm",
-                            "right": "0.8cm",
-                            "bottom": "1.5cm",
-                            "left": "0.8cm",
-                        },
-                        print_background=False,
-                        prefer_css_page_size=True,
-                    )
-                    logger.info(
-                        f"✅ Финальный PDF с рабочими ссылками сохранен: {output_pdf}"
-                    )
-                else:
-                    logger.warning(
-                        "Не удалось собрать HTML части, используем метод замены страниц"
-                    )
-                    updated_toc_html_doc = combine_html_document(
-                        original_styles="",
-                        toc_html=updated_toc_html,
-                        content_parts=[],
-                        toc_only=True,
-                    )
-
-                    updated_toc_pdf = os.path.join(chunks_dir, "toc_updated.pdf")
-                    await print_toc_only_pdf(
-                        page, updated_toc_html_doc, updated_toc_pdf
-                    )
-
-                    logger.info("Замена страниц оглавления в финальном PDF...")
-                    await replace_toc_pages_in_pdf(
-                        updated_toc_pdf,
-                        merged_pdf_path,
-                        output_pdf,
-                        toc_pages_count,
-                        anchor_page_map,
-                    )
 
                 total_time = time.time() - start_time
                 logger.info("✅ Генерация завершена успешно!")
