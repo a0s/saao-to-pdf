@@ -1582,6 +1582,11 @@ def parse_arguments():
         default=1,
         help="Количество секций в одной части при использовании --solution-chunk-by-sections (по умолчанию: 1)",
     )
+    parser.add_argument(
+        "--skip-chunk-download",
+        action="store_true",
+        help="Пропустить этап скачивания и генерации чанков (использовать существующие чанки в chunks/)",
+    )
     return parser.parse_args()
 
 
@@ -1721,6 +1726,170 @@ async def main_async():
 
                 original_styles = await extract_original_styles(page)
 
+                chunks_dir = "chunks"
+                os.makedirs(chunks_dir, exist_ok=True)
+                logger.info(f"Создана папка для чанков: {chunks_dir}")
+
+                section_chunks = chunk_sections_by_size(
+                    sections_to_process, args.chunk_sections_size
+                )
+
+                chunk_pdf_paths = []
+
+                if args.skip_chunk_download:
+                    logger.info("Пропуск этапа скачивания чанков (--skip-chunk-download)")
+                    for chunk_idx in range(len(section_chunks)):
+                        chunk_pdf_path = os.path.join(
+                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.pdf"
+                        )
+                        if os.path.exists(chunk_pdf_path):
+                            chunk_reader = PdfReader(chunk_pdf_path)
+                            logger.info(
+                                f"  Найден существующий чанк {chunk_idx + 1}: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
+                            )
+                            chunk_pdf_paths.append(chunk_pdf_path)
+                        else:
+                            logger.warning(
+                                f"  Чанк {chunk_idx + 1} не найден: {chunk_pdf_path}"
+                            )
+
+                    if not chunk_pdf_paths:
+                        logger.error(
+                            "Не найдено существующих чанков. Убедитесь, что они находятся в папке chunks/"
+                        )
+                        return
+                else:
+                    for chunk_idx, section_chunk in enumerate(section_chunks):
+                        logger.info(
+                            f"Обработка части {chunk_idx + 1}/{len(section_chunks)} ({len(section_chunk)} секций)"
+                        )
+
+                        tasks = []
+                        section_headers = []
+
+                        task_index = 0
+                        for section_idx, section in enumerate(section_chunk):
+                            section_name = section.get("section_name", "")
+                            logger.info(f"  Подготовка секции: {section_name}")
+
+                            original_section_idx = sections_to_process.index(section)
+                            section_anchor = f"section-{original_section_idx}"
+
+                            if section_idx > 0:
+                                page_break = "page-break-before: always !important;"
+                            else:
+                                page_break = "page-break-before: auto;"
+                            section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
+                            section_headers.append((section_idx, section_header))
+
+                            items = section.get("items", [])
+                            if MAX_ITEMS_PER_SECTION:
+                                items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                            else:
+                                items_to_process = items
+
+                            for item_idx, item in enumerate(items_to_process):
+                                item_name = item.get("item_name", "")
+                                item_url = item.get("item_href", "")
+
+                                is_first_item = (
+                                    chunk_idx == 0 and section_idx == 0 and item_idx == 0
+                                )
+
+                                tasks.append(
+                                    (task_index, item_url, item_name, is_first_item)
+                                )
+                                task_index += 1
+
+                        if not tasks:
+                            logger.warning(
+                                f"Нет задач для части {chunk_idx + 1}, пропускаем"
+                            )
+                            continue
+
+                        start_time_chunk = time.time()
+                        logger.info(
+                            f"  Начинаем параллельную обработку {len(tasks)} элементов..."
+                        )
+
+                        item_contents = await process_items_parallel(
+                            p, tasks, args.worker_count
+                        )
+
+                        content_parts = []
+
+                        current_task_index = 0
+                        for section_idx, section in enumerate(section_chunk):
+                            section_headers_dict = dict(section_headers)
+                            if section_idx in section_headers_dict:
+                                content_parts.append(section_headers_dict[section_idx])
+
+                            items = section.get("items", [])
+                            if MAX_ITEMS_PER_SECTION:
+                                items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                            else:
+                                items_to_process = items
+
+                            for item_idx, item in enumerate(items_to_process):
+                                if current_task_index < len(item_contents):
+                                    content = item_contents[current_task_index]
+                                    if content:
+                                        content_parts.append(content)
+                                    current_task_index += 1
+
+                        chunk_html = combine_html_content_only(
+                            original_styles, content_parts
+                        )
+
+                        chunk_html_path = os.path.join(
+                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.html"
+                        )
+                        with open(chunk_html_path, "w", encoding="utf-8") as f:
+                            f.write(chunk_html)
+
+                        chunk_pdf_path = os.path.join(
+                            chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.pdf"
+                        )
+
+                        try:
+                            await page.set_content(chunk_html, wait_until="networkidle")
+                            await page.wait_for_timeout(2000)
+
+                            await page.pdf(
+                                path=chunk_pdf_path,
+                                format="A4",
+                                margin={
+                                    "top": "1cm",
+                                    "right": "0.8cm",
+                                    "bottom": "1.5cm",
+                                    "left": "0.8cm",
+                                },
+                                print_background=False,
+                                prefer_css_page_size=True,
+                            )
+
+                            chunk_reader = PdfReader(chunk_pdf_path)
+                            logger.info(
+                                f"  ✅ Часть {chunk_idx + 1} сохранена: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
+                            )
+                            chunk_pdf_paths.append(chunk_pdf_path)
+
+                            chunk_time = time.time() - start_time_chunk
+                            logger.info(
+                                f"  ⏱️  Время обработки части: {format_time(chunk_time)}"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Ошибка при генерации части {chunk_idx + 1}: {e}",
+                                exc_info=True,
+                            )
+                            logger.warning(f"Пропускаем часть {chunk_idx + 1} и продолжаем")
+
+                if not chunk_pdf_paths:
+                    logger.error("Не удалось сгенерировать ни одной части")
+                    return
+
+                logger.info("Генерация оглавления после скачивания чанков...")
                 toc_html = generate_toc_html(sections_to_process)
 
                 toc_html_doc = combine_html_document(
@@ -1730,152 +1899,12 @@ async def main_async():
                     toc_only=True,
                 )
 
-                chunks_dir = "chunks"
-                os.makedirs(chunks_dir, exist_ok=True)
-                logger.info(f"Создана папка для чанков: {chunks_dir}")
-
                 toc_pdf_path = os.path.join(chunks_dir, "toc.pdf")
                 await print_toc_only_pdf(page, toc_html_doc, toc_pdf_path)
 
                 toc_reader = PdfReader(toc_pdf_path)
                 toc_pages_count = len(toc_reader.pages)
                 logger.info(f"Оглавление занимает {toc_pages_count} страниц")
-
-                section_chunks = chunk_sections_by_size(
-                    sections_to_process, args.chunk_sections_size
-                )
-
-                chunk_pdf_paths = []
-
-                for chunk_idx, section_chunk in enumerate(section_chunks):
-                    logger.info(
-                        f"Обработка части {chunk_idx + 1}/{len(section_chunks)} ({len(section_chunk)} секций)"
-                    )
-
-                    tasks = []
-                    section_headers = []
-
-                    task_index = 0
-                    for section_idx, section in enumerate(section_chunk):
-                        section_name = section.get("section_name", "")
-                        logger.info(f"  Подготовка секции: {section_name}")
-
-                        original_section_idx = sections_to_process.index(section)
-                        section_anchor = f"section-{original_section_idx}"
-
-                        if section_idx > 0:
-                            page_break = "page-break-before: always !important;"
-                        else:
-                            page_break = "page-break-before: auto;"
-                        section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
-                        section_headers.append((section_idx, section_header))
-
-                        items = section.get("items", [])
-                        if MAX_ITEMS_PER_SECTION:
-                            items_to_process = items[:MAX_ITEMS_PER_SECTION]
-                        else:
-                            items_to_process = items
-
-                        for item_idx, item in enumerate(items_to_process):
-                            item_name = item.get("item_name", "")
-                            item_url = item.get("item_href", "")
-
-                            is_first_item = (
-                                chunk_idx == 0 and section_idx == 0 and item_idx == 0
-                            )
-
-                            tasks.append(
-                                (task_index, item_url, item_name, is_first_item)
-                            )
-                            task_index += 1
-
-                    if not tasks:
-                        logger.warning(
-                            f"Нет задач для части {chunk_idx + 1}, пропускаем"
-                        )
-                        continue
-
-                    start_time_chunk = time.time()
-                    logger.info(
-                        f"  Начинаем параллельную обработку {len(tasks)} элементов..."
-                    )
-
-                    item_contents = await process_items_parallel(
-                        p, tasks, args.worker_count
-                    )
-
-                    content_parts = []
-
-                    current_task_index = 0
-                    for section_idx, section in enumerate(section_chunk):
-                        section_headers_dict = dict(section_headers)
-                        if section_idx in section_headers_dict:
-                            content_parts.append(section_headers_dict[section_idx])
-
-                        items = section.get("items", [])
-                        if MAX_ITEMS_PER_SECTION:
-                            items_to_process = items[:MAX_ITEMS_PER_SECTION]
-                        else:
-                            items_to_process = items
-
-                        for item_idx, item in enumerate(items_to_process):
-                            if current_task_index < len(item_contents):
-                                content = item_contents[current_task_index]
-                                if content:
-                                    content_parts.append(content)
-                                current_task_index += 1
-
-                    chunk_html = combine_html_content_only(
-                        original_styles, content_parts
-                    )
-
-                    chunk_html_path = os.path.join(
-                        chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.html"
-                    )
-                    with open(chunk_html_path, "w", encoding="utf-8") as f:
-                        f.write(chunk_html)
-
-                    chunk_pdf_path = os.path.join(
-                        chunks_dir, f"combined_document_part_{chunk_idx + 1:03d}.pdf"
-                    )
-
-                    try:
-                        await page.set_content(chunk_html, wait_until="networkidle")
-                        await page.wait_for_timeout(2000)
-
-                        await page.pdf(
-                            path=chunk_pdf_path,
-                            format="A4",
-                            margin={
-                                "top": "1cm",
-                                "right": "0.8cm",
-                                "bottom": "1.5cm",
-                                "left": "0.8cm",
-                            },
-                            print_background=False,
-                            prefer_css_page_size=True,
-                        )
-
-                        chunk_reader = PdfReader(chunk_pdf_path)
-                        logger.info(
-                            f"  ✅ Часть {chunk_idx + 1} сохранена: {chunk_pdf_path} ({len(chunk_reader.pages)} страниц)"
-                        )
-                        chunk_pdf_paths.append(chunk_pdf_path)
-
-                        chunk_time = time.time() - start_time_chunk
-                        logger.info(
-                            f"  ⏱️  Время обработки части: {format_time(chunk_time)}"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Ошибка при генерации части {chunk_idx + 1}: {e}",
-                            exc_info=True,
-                        )
-                        logger.warning(f"Пропускаем часть {chunk_idx + 1} и продолжаем")
-
-                if not chunk_pdf_paths:
-                    logger.error("Не удалось сгенерировать ни одной части")
-                    return
 
                 logger.info("Склеивание всех частей контента...")
                 merged_content_pdf = os.path.join(chunks_dir, "merged_content.pdf")
