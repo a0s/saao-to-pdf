@@ -122,16 +122,19 @@ def generate_toc_html(sections, include_page_numbers=True):
         section_name = section.get("section_name", "")
         section_anchor = f"section-{section_idx}"
 
+        # Начинаем контейнер секции
+        toc_items.append('    <div class="toc-section-wrapper">')
+
         # Заголовок секции
         if include_page_numbers:
             toc_items.append(
-                f'    <h2 class="toc-section"><a href="#{section_anchor}">{section_name}     <span class="toc-page"></span></a></h2>'
+                f'      <h2 class="toc-section"><a href="#{section_anchor}">{section_name}     <span class="toc-page"></span></a></h2>'
             )
         else:
             toc_items.append(
-                f'    <h2 class="toc-section"><a href="#{section_anchor}">{section_name}</a></h2>'
+                f'      <h2 class="toc-section"><a href="#{section_anchor}">{section_name}</a></h2>'
             )
-        toc_items.append('    <ul class="toc-items">')
+        toc_items.append('      <ul class="toc-items">')
 
         # Элементы секции
         for item in section.get("items", []):
@@ -148,14 +151,16 @@ def generate_toc_html(sections, include_page_numbers=True):
 
             if include_page_numbers:
                 toc_items.append(
-                    f'      <li class="toc-item"><a href="#{item_anchor}"><span class="toc-text">{display_name}</span>     <span class="toc-page"></span></a></li>'
+                    f'        <li class="toc-item"><a href="#{item_anchor}"><span class="toc-text">{display_name}</span>     <span class="toc-page"></span></a></li>'
                 )
             else:
                 toc_items.append(
-                    f'      <li class="toc-item"><a href="#{item_anchor}"><span class="toc-text">{display_name}</span></a></li>'
+                    f'        <li class="toc-item"><a href="#{item_anchor}"><span class="toc-text">{display_name}</span></a></li>'
                 )
 
-        toc_items.append("    </ul>")
+        toc_items.append("      </ul>")
+        # Закрываем контейнер секции
+        toc_items.append("    </div>")
 
     toc_html = f"""
 <div class="toc-container">
@@ -178,6 +183,11 @@ def generate_toc_html(sections, include_page_numbers=True):
     margin-bottom: 1em;
     text-align: center;
     page-break-after: avoid;
+  }
+
+  .toc-section-wrapper {
+    page-break-inside: avoid;
+    margin-bottom: 0.5em;
   }
 
   .toc-section {
@@ -255,6 +265,11 @@ def generate_toc_html(sections, include_page_numbers=True):
   @media print {
     .toc-container {
       page-break-after: always;
+    }
+
+    .toc-section-wrapper {
+      page-break-inside: avoid;
+      page-break-after: avoid;
     }
 
     .toc-section, .toc-item {
@@ -465,6 +480,11 @@ def combine_html_document(original_styles, toc_html, content_parts, toc_only=Fal
     page-break-after: avoid;
   }}
 
+  .toc-section-wrapper {{
+    page-break-inside: avoid;
+    margin-bottom: 0.5em;
+  }}
+
   .toc-section {{
     font-size: 1.3em;
     font-weight: bold;
@@ -501,6 +521,11 @@ def combine_html_document(original_styles, toc_html, content_parts, toc_only=Fal
   }}
 
   @media print {{
+    .toc-section-wrapper {{
+      page-break-inside: avoid;
+      page-break-after: avoid;
+    }}
+
     .toc-section, .toc-item {{
       page-break-inside: avoid;
     }}
@@ -787,7 +812,19 @@ def parse_arguments():
         "--target-pdf",
         type=str,
         default=None,
-        help="Путь к выходному PDF файлу (по умолчанию: table_of_content.pdf для --table-of-content-only, combined_saa_pdf.pdf для полного режима)",
+        help="Путь к выходному PDF файлу (по умолчанию: table_of_content.pdf для --table-of-content-only, combined_document.pdf для полного режима)",
+    )
+    parser.add_argument(
+        "--section-start",
+        type=int,
+        default=0,
+        help="Индекс начальной секции для обработки (по умолчанию: 0). Может быть отрицательным для отсчета с конца (например: -3 означает 3 секции с конца)",
+    )
+    parser.add_argument(
+        "--section-count",
+        type=int,
+        default=None,
+        help="Количество секций для обработки (по умолчанию: все секции от section-start до конца)",
     )
     return parser.parse_args()
 
@@ -804,7 +841,7 @@ def main():
         logger.info("Режим: генерация только оглавления")
     else:
         default_html = "combined_document.html"
-        default_pdf = "combined_saa_pdf.pdf"
+        default_pdf = "combined_document.pdf"
         logger.info("Начало генерации объединенного PDF")
 
     # Используем указанные значения или дефолтные
@@ -822,13 +859,41 @@ def main():
         logger.error("Нет секций в метаданных")
         return
 
-    # Ограничиваемся первыми MAX_SECTIONS секциями (если указано)
-    if MAX_SECTIONS is None:
-        sections_to_process = sections
+    # Определяем начальный индекс секции
+    section_start = args.section_start
+    total_sections = len(sections)
+
+    # Обрабатываем отрицательные индексы (отсчет с конца)
+    if section_start < 0:
+        section_start = total_sections + section_start
+        if section_start < 0:
+            section_start = 0
+            logger.warning(
+                f"Индекс {args.section_start} выходит за границы, начинаем с 0"
+            )
+
+    # Проверяем, что индекс не выходит за границы
+    if section_start >= total_sections:
+        logger.error(
+            f"Индекс начальной секции {section_start} выходит за границы (всего секций: {total_sections})"
+        )
+        return
+
+    # Определяем конечный индекс секции
+    if args.section_count is not None:
+        section_count = args.section_count
+        if section_count <= 0:
+            logger.error("Количество секций должно быть положительным числом")
+            return
+        section_end = min(section_start + section_count, total_sections)
     else:
-        sections_to_process = sections[:MAX_SECTIONS]
+        section_end = total_sections
+
+    # Выбираем секции для обработки
+    sections_to_process = sections[section_start:section_end]
+
     logger.info(
-        f"Обработка {len(sections_to_process)} секций (всего в файле: {len(sections)})"
+        f"Обработка секций {section_start}-{section_end-1} ({len(sections_to_process)} секций из {total_sections} всего)"
     )
 
     with sync_playwright() as p:
