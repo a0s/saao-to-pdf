@@ -4,12 +4,17 @@
 Обрабатывает первые 2 секции и создает единый PDF с навигацией
 """
 
+import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import time
+from asyncio import Semaphore
+from concurrent.futures import ThreadPoolExecutor
 
+from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
 
 # Импортируем стили и функции из print_with_fix.py
@@ -24,11 +29,13 @@ logger = logging.getLogger(__name__)
 # Константы
 METADATA_FILE = "links_metadata.json"
 OUTPUT_PDF = "combined_saa_pdf.pdf"
+INTERMEDIATE_HTML = "combined_document.html"  # Промежуточный HTML файл
 TIMEOUT = 30000  # 30 секунд
-MAX_SECTIONS = None  # None = обрабатывать все секции, или укажите число для ограничения
+MAX_SECTIONS = None  # None = обрабатывать все секции, или укажите число для ограничения (можно переопределить через --max-sections)
 MAX_ITEMS_PER_SECTION = (
     None  # None = обрабатывать все элементы в секции, или укажите число для ограничения
 )
+NUM_WORKERS = 10  # Количество параллельных браузеров для обработки
 
 
 def format_time(seconds):
@@ -44,6 +51,58 @@ def format_time(seconds):
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
         return f"{hours}ч {minutes}м {secs}с"
+
+
+async def process_items_async(tasks, total_items, start_time):
+    """Async обработка всех элементов параллельно"""
+    semaphore = Semaphore(NUM_WORKERS)
+    processed = 0
+    results = {}
+    processed_lock = asyncio.Lock()
+
+    async def process_task_async(task_data):
+        """Обработка одной задачи async"""
+        nonlocal processed
+        position_key, item_url, item_name, is_first_item = task_data
+
+        async with semaphore:
+            async with async_playwright() as p_async:
+                browser = await p_async.chromium.launch(headless=True)
+                worker_page = await browser.new_page()
+                try:
+                    content = await process_item_page_async(
+                        worker_page, item_url, item_name, is_first_item
+                    )
+
+                    # Обновляем прогресс
+                    async with processed_lock:
+                        processed += 1
+                        elapsed_time = time.time() - start_time
+                        if processed > 0:
+                            avg_time_per_item = elapsed_time / processed
+                            remaining_items = total_items - processed
+                            estimated_remaining_time = (
+                                avg_time_per_item * remaining_items
+                            )
+
+                            elapsed_str = format_time(elapsed_time)
+                            remaining_str = format_time(estimated_remaining_time)
+
+                            logger.info(
+                                f"Прогресс: {processed}/{total_items} | "
+                                f"Прошло: {elapsed_str} | "
+                                f"Осталось ~{remaining_str} | "
+                                f"Обработан: {item_name}"
+                            )
+
+                    if content:
+                        results[position_key] = content
+                finally:
+                    await browser.close()
+
+    # Запускаем все задачи параллельно
+    await asyncio.gather(*[process_task_async(task) for task in tasks])
+    return results
 
 
 def load_metadata():
@@ -270,6 +329,256 @@ def generate_toc_html(sections):
     return toc_css + toc_html
 
 
+async def inject_print_styles_async(page):
+    """Async версия inject_print_styles - точная копия sync версии"""
+    await page.add_style_tag(content=PRINT_FIX_CSS)
+
+    # Подготовка страницы для печати через JavaScript (точная копия из print_with_fix.py)
+    prepare_script = """
+    (function() {
+      // Скрываем навигацию и лишние элементы
+      const elementsToHide = [
+        'header', 'nav', '.header', '.navigation', '.breadcrumb',
+        '#p4MenuOutline', '.p4MenuOutline', '.menu', '.sidebar'
+      ];
+
+      elementsToHide.forEach(selector => {
+        try {
+          const elements = document.querySelectorAll(selector);
+          elements.forEach(el => {
+            if (el) el.style.display = 'none';
+          });
+        } catch(e) {}
+      });
+
+      // Находим заголовки
+      const titleElement = document.querySelector('#p4HeadTitle');
+      const subtitleElement = document.querySelector('h1.p3h2 > a, h1.p3h2');
+
+      // Извлекаем текст заголовков
+      let titleText = '';
+      let subtitleText = '';
+
+      if (titleElement) {
+        titleText = titleElement.textContent.trim();
+      }
+
+      if (subtitleElement) {
+        subtitleText = subtitleElement.textContent.trim();
+        // Убираем лишний текст типа [via saao/saa01] если есть
+        subtitleText = subtitleText.replace(/\\s*\\[via[^\\]]+\\]\\s*/gi, '').trim();
+      }
+
+      // Создаем контейнер для заголовков
+      const headerContainer = document.createElement('div');
+      headerContainer.className = 'doc-headers';
+      headerContainer.style.marginBottom = '1em';
+
+      // Создаем первый заголовок (h2) с якорем
+      if (titleText) {
+        const h2 = document.createElement('h2');
+        h2.className = 'doc-title-h2';
+        h2.id = 'doc-title';
+        h2.textContent = titleText;
+        headerContainer.appendChild(h2);
+      }
+
+      // Создаем второй заголовок (h3) с якорем
+      if (subtitleText) {
+        const h3 = document.createElement('h3');
+        h3.className = 'doc-title-h3';
+        // Создаем ID из текста заголовка (для якоря)
+        const anchorId = subtitleText.toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .substring(0, 50);
+        h3.id = anchorId || 'doc-subtitle';
+        h3.textContent = subtitleText;
+        headerContainer.appendChild(h3);
+      }
+
+      // Находим первую таблицу
+      const tables = document.querySelectorAll('table');
+      if (tables.length > 0) {
+        const firstTable = tables[0];
+
+        // Скрываем все предыдущие элементы
+        let element = firstTable.previousElementSibling;
+        while (element) {
+          const prev = element.previousElementSibling;
+          element.style.display = 'none';
+          element = prev;
+        }
+
+        // Скрываем все элементы в родителе до таблицы
+        let parent = firstTable.parentElement;
+        while (parent && parent !== document.body) {
+          let sibling = parent.previousElementSibling;
+          while (sibling) {
+            const prev = sibling.previousElementSibling;
+            if (!sibling.contains(firstTable)) {
+              sibling.style.display = 'none';
+            }
+            sibling = prev;
+          }
+          parent = parent.parentElement;
+        }
+
+        // Вставляем заголовки перед таблицей
+        if (headerContainer.children.length > 0) {
+          if (firstTable.parentElement === document.body) {
+            firstTable.parentElement.insertBefore(headerContainer, firstTable);
+          } else {
+            // Если таблица не в body, перемещаем и таблицу, и заголовки
+            const container = document.createElement('div');
+            container.className = 'doc-content';
+            container.appendChild(headerContainer);
+
+            const clone = firstTable.cloneNode(true);
+            container.appendChild(clone);
+
+            document.body.insertBefore(container, document.body.firstChild);
+            firstTable.style.display = 'none';
+          }
+        }
+      } else {
+        // Если таблицы нет, просто добавляем заголовки в начало body
+        if (headerContainer.children.length > 0) {
+          document.body.insertBefore(headerContainer, document.body.firstChild);
+        }
+      }
+
+      // Скрываем оригинальные заголовки
+      if (titleElement) titleElement.style.display = 'none';
+      if (subtitleElement && subtitleElement.parentElement) {
+        subtitleElement.parentElement.style.display = 'none';
+      }
+
+      // Убираем пустые элементы
+      const allElements = document.querySelectorAll('div, p, section');
+      allElements.forEach(el => {
+        if (el && el.children.length === 0 && !el.textContent.trim()) {
+          el.style.display = 'none';
+        }
+      });
+
+      // Убираем горизонтальные линии
+      document.querySelectorAll('hr').forEach(hr => hr.style.display = 'none');
+    })();
+    """
+    await page.evaluate(prepare_script)
+
+
+async def process_item_page_async(page, item_url, item_name, is_first_item=False):
+    """Async версия process_item_page"""
+    try:
+        # Добавляем /html к URL если его нет
+        if not item_url.endswith("/html"):
+            item_url = item_url.rstrip("/") + "/html"
+
+        logger.info(f"Обработка: {item_name} - {item_url}")
+
+        # Загружаем страницу
+        await page.goto(item_url, wait_until="networkidle", timeout=TIMEOUT)
+        await page.wait_for_timeout(1000)
+
+        # Применяем стили для печати
+        await inject_print_styles_async(page)
+        await page.wait_for_timeout(500)
+
+        # Извлекаем обработанный контент (точная копия sync версии)
+        content_html = await page.evaluate(
+            """
+        () => {
+          // Находим контейнер с заголовками и таблицей
+          const docContent = document.querySelector('.doc-content');
+          const docHeaders = document.querySelector('.doc-headers');
+          const tables = document.querySelectorAll('table');
+
+          let html = '';
+
+          // Если есть doc-content контейнер, извлекаем только h3 и таблицу (пропускаем h2)
+          if (docContent) {
+            // Извлекаем только h3 (subtitle), пропускаем h2 (title)
+            const h3 = docContent.querySelector('h3.doc-title-h3');
+            if (h3) {
+              html += h3.outerHTML;
+            }
+            // Извлекаем таблицы из контейнера
+            const containerTables = docContent.querySelectorAll('table');
+            containerTables.forEach(table => {
+              html += table.outerHTML;
+            });
+          } else {
+            // Иначе собираем только h3 (subtitle) и таблицу, пропускаем h2 (title)
+            if (docHeaders) {
+              // Извлекаем только h3, пропускаем h2
+              const h3 = docHeaders.querySelector('h3.doc-title-h3');
+              if (h3) {
+                html += h3.outerHTML;
+              }
+            }
+
+            if (tables.length > 0) {
+              tables.forEach(table => {
+                html += table.outerHTML;
+              });
+            }
+          }
+
+          return html;
+        }
+        """
+        )
+
+        if not content_html:
+            logger.warning(f"Не удалось извлечь контент для {item_name}")
+            return None
+
+        # Добавляем якорь к заголовку h3
+        item_anchor = generate_anchor_id(item_name, "item")
+
+        content_html = re.sub(
+            r'(<h3[^>]*?)(\s+id=["\'][^"\']*["\'])+',
+            r"\1",
+            content_html,
+        )
+
+        if (
+            'class="doc-title-h3"' in content_html
+            or "class='doc-title-h3'" in content_html
+        ):
+            content_html = re.sub(
+                r'(<h3[^>]*class=["\']doc-title-h3["\'][^>]*)',
+                f'\\1 id="{item_anchor}"',
+                content_html,
+                count=1,
+            )
+        elif "<h3" in content_html:
+            content_html = re.sub(
+                r"(<h3)([^>]*)(>)",
+                f'\\1\\2 id="{item_anchor}" class="doc-title-h3"\\3',
+                content_html,
+                count=1,
+            )
+        else:
+            content_html = (
+                f'<h3 id="{item_anchor}" class="doc-title-h3"></h3>{content_html}'
+            )
+
+        # Обертываем в div с page-break
+        if not is_first_item:
+            content_html = f'<div class="item-content" style="page-break-before: always;">{content_html}</div>'
+        else:
+            content_html = f'<div class="item-content">{content_html}</div>'
+
+        return content_html
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке {item_name}: {e}", exc_info=True)
+        return None
+
+
 def process_item_page(page, item_url, item_name, is_first_item=False):
     """
     Загрузить и обработать страницу элемента
@@ -483,13 +792,31 @@ def combine_html_document(original_styles, toc_html, content_parts):
     return full_html
 
 
-def print_combined_pdf(page, html_content, output_path):
+def print_combined_pdf(page, html_content, output_path, html_file_path=None):
     """Распечатать объединенный HTML в PDF используя существующую страницу"""
     logger.info(f"Генерация PDF: {output_path}")
 
-    # Загружаем HTML контент
-    page.set_content(html_content, wait_until="networkidle")
-    page.wait_for_timeout(2000)  # Даем время на применение стилей
+    # Для больших файлов используем file:// URL вместо set_content
+    if html_file_path and os.path.exists(html_file_path):
+        file_size = os.path.getsize(html_file_path)
+        logger.info(f"Загрузка HTML через file:// URL: {html_file_path}")
+        logger.info(
+            f"Размер HTML файла: {file_size / 1024 / 1024:.2f} MB ({file_size} байт)"
+        )
+        file_url = f"file://{os.path.abspath(html_file_path)}"
+        page.goto(file_url, wait_until="domcontentloaded", timeout=120000)
+    elif html_content:
+        logger.info("Загрузка HTML через set_content")
+        logger.info(
+            f"Размер HTML для загрузки: {len(html_content) / 1024 / 1024:.2f} MB ({len(html_content)} байт)"
+        )
+        page.set_content(html_content, wait_until="domcontentloaded", timeout=120000)
+    else:
+        raise ValueError("Необходимо указать либо html_content, либо html_file_path")
+
+    page.wait_for_timeout(
+        5000
+    )  # Даем больше времени на применение стилей и загрузку ресурсов
 
     # Вычисляем номера страниц для оглавления
     logger.info("Вычисление номеров страниц для оглавления...")
@@ -631,8 +958,77 @@ def print_combined_pdf(page, html_content, output_path):
     logger.info(f"✅ PDF успешно сохранен: {output_path}")
 
 
+def generate_pdf_from_html(html_file_path, output_pdf_path):
+    """Генерирует PDF из сохраненного HTML файла"""
+    logger.info(f"Генерация PDF из HTML файла: {html_file_path}")
+
+    if not os.path.exists(html_file_path):
+        logger.error(f"HTML файл не найден: {html_file_path}")
+        return False
+
+    file_size = os.path.getsize(html_file_path)
+    logger.info(
+        f"Размер HTML файла: {file_size / 1024 / 1024:.2f} MB ({file_size} байт)"
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            # Передаем путь к файлу для загрузки через file:// URL
+            print_combined_pdf(
+                page, None, output_pdf_path, html_file_path=html_file_path
+            )
+            logger.info("✅ PDF успешно сгенерирован из HTML!")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при генерации PDF: {e}", exc_info=True)
+            return False
+        finally:
+            browser.close()
+
+
 def main():
     """Основная функция"""
+    parser = argparse.ArgumentParser(
+        description="Генерация объединенного PDF из links_metadata.json"
+    )
+    parser.add_argument(
+        "--from-html",
+        action="store_true",
+        help="Пропустить фетчинг и сгенерировать PDF из сохраненного HTML файла",
+    )
+    parser.add_argument(
+        "--html-file",
+        default=INTERMEDIATE_HTML,
+        help=f"Путь к HTML файлу (по умолчанию: {INTERMEDIATE_HTML})",
+    )
+    parser.add_argument(
+        "--output",
+        default=OUTPUT_PDF,
+        help=f"Путь к выходному PDF файлу (по умолчанию: {OUTPUT_PDF})",
+    )
+    parser.add_argument(
+        "--min-section",
+        type=int,
+        default=None,
+        help="Индекс первой секции для обработки (0-based). Например, --min-section 263 для последних двух секций",
+    )
+    parser.add_argument(
+        "--max-sections",
+        type=int,
+        default=None,
+        help="Максимальное количество секций для обработки",
+    )
+
+    args = parser.parse_args()
+
+    # Если указан флаг --from-html, пропускаем фетчинг
+    if args.from_html:
+        logger.info("Режим: генерация PDF из HTML (пропуск фетчинга)")
+        generate_pdf_from_html(args.html_file, args.output)
+        return
+
     logger.info("Начало генерации объединенного PDF")
 
     # Загружаем метаданные
@@ -646,14 +1042,31 @@ def main():
         logger.error("Нет секций в метаданных")
         return
 
-    # Ограничиваемся первыми MAX_SECTIONS секциями (если указано)
-    if MAX_SECTIONS is None:
-        sections_to_process = sections
+    # Определяем, какие секции обрабатывать
+    min_idx = args.min_section
+    max_count = args.max_sections if args.max_sections is not None else MAX_SECTIONS
+
+    if min_idx is not None:
+        # Начинаем с указанного индекса
+        if min_idx < 0:
+            # Отрицательный индекс означает "с конца"
+            min_idx = len(sections) + min_idx
+        sections_to_process = sections[min_idx:]
+        logger.info(f"Начинаем с секции {min_idx + 1} (индекс {min_idx})")
     else:
-        sections_to_process = sections[:MAX_SECTIONS]
+        sections_to_process = sections
+
+    if max_count is not None:
+        # Ограничиваем количество секций
+        sections_to_process = sections_to_process[:max_count]
+
     logger.info(
         f"Обработка {len(sections_to_process)} секций (всего в файле: {len(sections)})"
     )
+
+    if len(sections_to_process) == 0:
+        logger.error("Нет секций для обработки")
+        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -685,19 +1098,9 @@ def main():
             # Шаг 2: Генерируем оглавление
             toc_html = generate_toc_html(sections_to_process)
 
-            # Шаг 3: Обрабатываем все элементы
-            content_parts = []
-            # Пересчитываем total_items с учетом ограничений
-            if MAX_ITEMS_PER_SECTION:
-                total_items = sum(
-                    min(len(s.get("items", [])), MAX_ITEMS_PER_SECTION)
-                    for s in sections_to_process
-                )
-            else:
-                total_items = sum(len(s.get("items", [])) for s in sections_to_process)
-            processed = 0
-            start_time = time.time()
-
+            # Шаг 3: Обрабатываем все элементы параллельно
+            # Сначала создаем заголовки секций
+            section_headers = {}
             for section_idx, section in enumerate(sections_to_process):
                 section_name = section.get("section_name", "")
                 logger.info(f"Обработка секции {section_idx + 1}: {section_name}")
@@ -710,8 +1113,13 @@ def main():
                 else:
                     page_break = "page-break-before: auto;"
                 section_header = f'<div id="{section_anchor}" class="section-header" style="{page_break} margin-top: 2em; margin-bottom: 1em;"><h2 class="section-title">{section_name}</h2></div>'
-                content_parts.append(section_header)
+                # Используем кортеж (section_idx, -1) для секций, чтобы они шли перед элементами
+                section_headers[(section_idx, -1)] = section_header
 
+            # Собираем все задачи для параллельной обработки
+            tasks = []
+
+            for section_idx, section in enumerate(sections_to_process):
                 items = section.get("items", [])
                 # Ограничиваем количество элементов если указано
                 if MAX_ITEMS_PER_SECTION:
@@ -722,47 +1130,81 @@ def main():
                 for item_idx, item in enumerate(items_to_process):
                     item_name = item.get("item_name", "")
                     item_url = item.get("item_href", "")
-
-                    processed += 1
-
-                    # Вычисляем время и оставшееся время
-                    elapsed_time = time.time() - start_time
-                    if processed > 0:
-                        avg_time_per_item = elapsed_time / processed
-                        remaining_items = total_items - processed
-                        estimated_remaining_time = avg_time_per_item * remaining_items
-
-                        # Форматируем время
-                        elapsed_str = format_time(elapsed_time)
-                        remaining_str = format_time(estimated_remaining_time)
-
-                        logger.info(
-                            f"Прогресс: {processed}/{total_items} | "
-                            f"Прошло: {elapsed_str} | "
-                            f"Осталось ~{remaining_str}"
-                        )
-                    else:
-                        logger.info(f"Прогресс: {processed}/{total_items}")
-
-                    # Первый элемент в первой секции не должен иметь разрыв страницы
                     is_first_item = section_idx == 0 and item_idx == 0
-                    content = process_item_page(
-                        page, item_url, item_name, is_first_item
+
+                    # Используем кортеж (section_idx, item_idx) для правильной сортировки
+                    tasks.append(
+                        ((section_idx, item_idx), item_url, item_name, is_first_item)
                     )
-                    if content:
-                        content_parts.append(content)
+
+            total_items = len(tasks)
+            logger.info(
+                f"Запуск параллельной обработки {total_items} элементов с {NUM_WORKERS} воркерами"
+            )
+
+            # Запускаем async обработку в отдельном потоке
+            start_time = time.time()
+
+            def run_async():
+                return asyncio.run(process_items_async(tasks, total_items, start_time))
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_async)
+                results = future.result()
+
+            # Собираем финальный контент в правильном порядке
+            final_content_parts = []
+            for section_idx, section in enumerate(sections_to_process):
+                # Добавляем заголовок секции
+                final_content_parts.append(section_headers[(section_idx, -1)])
+
+                # Добавляем элементы секции в правильном порядке
+                items = section.get("items", [])
+                if MAX_ITEMS_PER_SECTION:
+                    items_to_process = items[:MAX_ITEMS_PER_SECTION]
+                else:
+                    items_to_process = items
+
+                for item_idx in range(len(items_to_process)):
+                    position_key = (section_idx, item_idx)
+                    if position_key in results:
+                        final_content_parts.append(results[position_key])
 
             # Шаг 4: Объединяем все в HTML
             combined_html = combine_html_document(
-                original_styles, toc_html, content_parts
+                original_styles, toc_html, final_content_parts
             )
 
-            # Сохраняем промежуточный HTML для отладки (опционально)
-            # with open("combined_document.html", "w", encoding="utf-8") as f:
-            #     f.write(combined_html)
+            # Сохраняем промежуточный HTML для возможности повторной генерации PDF
+            logger.info(f"Сохранение промежуточного HTML: {INTERMEDIATE_HTML}")
+            html_size = len(combined_html)
+            logger.info(
+                f"Размер HTML: {html_size / 1024 / 1024:.2f} MB ({html_size} байт)"
+            )
+            with open(INTERMEDIATE_HTML, "w", encoding="utf-8") as f:
+                f.write(combined_html)
+            # Проверяем, что файл действительно записался
+            saved_size = os.path.getsize(INTERMEDIATE_HTML)
+            if saved_size != html_size:
+                logger.warning(
+                    f"⚠️ Размер сохраненного файла ({saved_size}) не совпадает с размером HTML ({html_size})"
+                )
+            else:
+                logger.info(
+                    f"✅ HTML сохранен: {INTERMEDIATE_HTML} ({saved_size / 1024 / 1024:.2f} MB)"
+                )
 
-            # Шаг 5: Генерируем PDF (используем существующую страницу)
-            print_combined_pdf(page, combined_html, OUTPUT_PDF)
+            # Закрываем браузер после долгой обработки, чтобы избежать таймаутов
+            browser.close()
+
+            # Шаг 5: Генерируем PDF (создаем новый браузер)
+            logger.info("Создание нового браузера для генерации PDF...")
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            # Передаем путь к HTML файлу для загрузки через file:// URL (более надежно для больших файлов)
+            print_combined_pdf(
+                page, combined_html, args.output, html_file_path=INTERMEDIATE_HTML
+            )
 
             total_time = time.time() - start_time
             logger.info("✅ Генерация завершена успешно!")
