@@ -1,4 +1,4 @@
-# SAA
+# saao-to-pdf
 
 Tools for scraping the [State Archives of Assyria Online (SAAO)](https://oracc.museum.upenn.edu/saao) corpus from Oracc and compiling it into a single PDF.
 
