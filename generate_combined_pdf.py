@@ -12,6 +12,7 @@ import requests
 import urllib3
 from playwright.async_api import async_playwright
 from pypdf import PdfReader, PdfWriter
+from pypdf.annotations import Link
 
 from print_with_fix import PRINT_FIX_CSS
 
@@ -453,6 +454,11 @@ async def process_item_page(page, item_url, item_name, is_first_item=False):
             content_html = (
                 f'<div id="{item_anchor}" class="item-anchor"></div>{content_html}'
             )
+
+        content_html = re.sub(
+            r'<a\s+[^>]*href=["\'][^"\']*["\'][^>]*>', "", content_html
+        )
+        content_html = re.sub(r"</a>", "", content_html)
 
         content_html = f'<div class="item-content">{content_html}</div>'
 
@@ -1389,7 +1395,14 @@ async def add_internal_links_to_pdf(pdf_path, anchor_page_map, toc_pages_count):
 
 
 async def replace_toc_pages_in_pdf(
-    toc_pdf_path, content_pdf_path, output_path, toc_pages_count, anchor_page_map
+    toc_pdf_path,
+    content_pdf_path,
+    output_path,
+    toc_pages_count,
+    anchor_page_map,
+    page,
+    toc_html,
+    sections,
 ):
     """
     Склеивает оглавление и контент, добавляет named destinations для якорей
@@ -1401,6 +1414,9 @@ async def replace_toc_pages_in_pdf(
         output_path: Путь к финальному PDF
         toc_pages_count: Количество страниц оглавления
         anchor_page_map: Словарь {anchor_id: page_number} (номера страниц с учетом TOC)
+        page: Playwright page объект для определения позиций ссылок
+        toc_html: HTML оглавления для определения позиций ссылок на страницах
+        sections: Список секций для построения списка якорей
     """
     logger.info("Склеивание оглавления и контента с добавлением ссылок...")
 
@@ -1410,11 +1426,11 @@ async def replace_toc_pages_in_pdf(
 
         writer = PdfWriter()
 
-        for page in toc_reader.pages:
-            writer.add_page(page)
+        for page_obj in toc_reader.pages:
+            writer.add_page(page_obj)
 
-        for page in content_reader.pages:
-            writer.add_page(page)
+        for page_obj in content_reader.pages:
+            writer.add_page(page_obj)
 
         logger.info("Добавление named destinations для якорей...")
         destinations_added = 0
@@ -1427,59 +1443,221 @@ async def replace_toc_pages_in_pdf(
                     logger.debug(f"Не удалось добавить destination {anchor_id}: {e}")
         logger.info(f"Добавлено {destinations_added} named destinations")
 
-        logger.info("Добавление ссылок в оглавление...")
+        expected_anchors = []
+        for section_idx, section in enumerate(sections):
+            section_anchor = f"section-{section_idx}"
+            expected_anchors.append(section_anchor)
+
+            for item in section.get("items", []):
+                item_name = item.get("item_name", "")
+                item_anchor = generate_anchor_id(item_name, "item")
+                expected_anchors.append(item_anchor)
+
+        logger.info(f"Ожидается {len(expected_anchors)} якорей в оглавлении")
+        logger.info("Добавление ссылок в оглавление... (ВРЕМЕННО ОТКЛЮЧЕНО)")
+
         links_added = 0
-        for toc_page_idx in range(min(toc_pages_count, len(toc_reader.pages))):
-            try:
-                toc_page = toc_reader.pages[toc_page_idx]
-                text = toc_page.extract_text()
+        logger.info(f"Добавлено {links_added} ссылок в оглавление (отключено)")
 
-                import re
+        ENABLE_TOC_LINKS = False
+        if ENABLE_TOC_LINKS:
+            await page.set_content(toc_html, wait_until="networkidle")
+            await page.wait_for_timeout(2000)
 
-                link_pattern = r"(section-(\d+))|(item-([a-z0-9-]+))"
-                for match in re.finditer(link_pattern, text, re.IGNORECASE):
-                    anchor_id = None
-                    if match.group(2):
-                        anchor_id = f"section-{match.group(2)}"
-                    elif match.group(4):
-                        anchor_id = f"item-{match.group(4)}"
+            link_positions = await page.evaluate(
+                """
+            (expectedAnchors) => {
+                const pageHeightPx = 1123;
+                const marginTopPx = 38;
+                const marginBottomPx = 57;
+                const usablePageHeight = pageHeightPx - marginTopPx - marginBottomPx;
 
-                    if anchor_id and anchor_id in anchor_page_map:
-                        target_page_num = anchor_page_map[anchor_id]
-                        if target_page_num > 0 and target_page_num <= len(writer.pages):
-                            try:
-                                from pypdf.generic import RectangleObject
+                const links = [];
+                const allLinks = document.querySelectorAll('.toc-section a, .toc-item a');
+                const foundAnchors = [];
+                const notFoundAnchors = [];
 
-                                page_rect = toc_page.mediabox
-                                rect = RectangleObject(
-                                    [
-                                        float(page_rect.left),
-                                        float(page_rect.bottom),
-                                        float(page_rect.right),
-                                        float(page_rect.top),
-                                    ]
-                                )
-                                writer.add_link(
-                                    toc_page_idx,
-                                    target_page_num - 1,
-                                    rect,
-                                    border=None,
-                                    fit="/Fit",
-                                )
-                                links_added += 1
-                                logger.debug(
-                                    f"  Добавлена ссылка: {anchor_id} (страница {toc_page_idx + 1} -> {target_page_num})"
-                                )
-                            except Exception as e:
-                                logger.debug(
-                                    f"Не удалось добавить ссылку для {anchor_id}: {e}"
-                                )
-            except Exception as e:
-                logger.warning(
-                    f"Ошибка при обработке страницы оглавления {toc_page_idx + 1}: {e}"
+                allLinks.forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href && href.startsWith('#')) {
+                        const anchorId = href.substring(1);
+                        if (expectedAnchors.includes(anchorId)) {
+                            foundAnchors.push(anchorId);
+
+                            const rect = link.getBoundingClientRect();
+                            const bodyRect = document.body.getBoundingClientRect();
+
+                            const absoluteTop = rect.top - bodyRect.top + window.pageYOffset;
+                            const absoluteBottom = rect.bottom - bodyRect.top + window.pageYOffset;
+                            const absoluteLeft = rect.left - bodyRect.left + window.pageXOffset;
+                            const absoluteRight = rect.right - bodyRect.left + window.pageXOffset;
+
+                            const pageNum = 1 + Math.floor((absoluteTop - marginTopPx) / usablePageHeight);
+                            const yOnPage = absoluteTop - ((pageNum - 1) * usablePageHeight) - marginTopPx;
+
+                            links.push({
+                                anchorId: anchorId,
+                                pageNum: pageNum,
+                                x: absoluteLeft,
+                                y: yOnPage,
+                                width: absoluteRight - absoluteLeft,
+                                height: absoluteBottom - absoluteTop
+                            });
+                        } else {
+                            notFoundAnchors.push(anchorId);
+                        }
+                    }
+                });
+
+                return {
+                    links: links,
+                    foundAnchors: foundAnchors.slice(0, 10),
+                    notFoundAnchors: notFoundAnchors.slice(0, 10),
+                    totalLinks: allLinks.length
+                };
+            }
+            """,
+                expected_anchors,
+            )
+
+            if isinstance(link_positions, dict) and "links" in link_positions:
+                actual_links = link_positions["links"]
+                logger.info(
+                    f"Найдено {len(actual_links)} ссылок из {link_positions.get('totalLinks', 0)} в HTML"
                 )
+                if link_positions.get("notFoundAnchors"):
+                    logger.warning(
+                        f"Якоря не найдены в expectedAnchors: {link_positions['notFoundAnchors'][:5]}"
+                    )
+                link_positions = actual_links
+            else:
+                actual_links = link_positions
 
-        logger.info(f"Добавлено {links_added} ссылок в оглавление")
+            if len(link_positions) == 0:
+                logger.warning("Не найдено ссылок в HTML оглавления! Проверяю HTML...")
+            all_links_count = await page.evaluate(
+                "() => document.querySelectorAll('.toc-section a, .toc-item a').length"
+            )
+            logger.warning(f"Всего ссылок в HTML: {all_links_count}")
+            if all_links_count > 0:
+                sample_links = await page.evaluate(
+                    """
+                    () => {
+                        const links = [];
+                        document.querySelectorAll('.toc-section a, .toc-item a').forEach((link, idx) => {
+                            if (idx < 5) {
+                                links.push({
+                                    href: link.getAttribute('href'),
+                                    text: link.textContent.substring(0, 50)
+                                });
+                            }
+                        });
+                        return links;
+                    }
+                    """
+                )
+                logger.warning(f"Примеры ссылок: {sample_links}")
+
+            links_added = 0
+            skipped_no_target = 0
+            skipped_invalid_page = 0
+            errors = 0
+            for link_info in link_positions:
+                anchor_id = link_info["anchorId"]
+                toc_page_idx = link_info["pageNum"] - 1
+                target_page_num = anchor_page_map.get(anchor_id)
+
+                if not target_page_num:
+                    skipped_no_target += 1
+                    logger.warning(
+                        f"Пропущена ссылка {anchor_id}: нет целевой страницы в anchor_page_map"
+                    )
+                    continue
+
+                if toc_page_idx < 0 or toc_page_idx >= toc_pages_count:
+                    skipped_invalid_page += 1
+                    logger.warning(
+                        f"Пропущена ссылка {anchor_id}: неверный индекс страницы TOC {toc_page_idx + 1} (всего {toc_pages_count})"
+                    )
+                    continue
+
+            if target_page_num and toc_page_idx >= 0 and toc_page_idx < toc_pages_count:
+                try:
+                    toc_page = toc_reader.pages[toc_page_idx]
+                    page_rect = toc_page.mediabox
+
+                    y_on_page = float(link_info["y"])
+                    height = float(link_info["height"])
+                    x_browser = float(link_info["x"])
+                    width = float(link_info["width"])
+
+                    page_height_px = 1123
+                    page_height_pts = float(page_rect.top) - float(page_rect.bottom)
+                    scale_factor = page_height_pts / page_height_px
+
+                    y_top_px = y_on_page + height
+                    y_bottom_px = y_on_page
+
+                    y_top_pts = float(page_rect.top) - (y_top_px * scale_factor)
+                    y_bottom_pts = float(page_rect.top) - (y_bottom_px * scale_factor)
+
+                    x1 = float(page_rect.left) + (x_browser * scale_factor)
+                    y1 = max(float(page_rect.bottom), y_bottom_pts - 2)
+                    x2 = x1 + (width * scale_factor)
+                    y2 = min(float(page_rect.top), y_top_pts + 2)
+
+                    if x2 > float(page_rect.right):
+                        x2 = float(page_rect.right)
+                    if x1 < float(page_rect.left):
+                        x1 = float(page_rect.left)
+                    if y2 <= y1:
+                        y2 = y1 + (height * scale_factor) + 4
+
+                    from pypdf.generic import NameObject
+
+                    annotation = Link(
+                        rect=(x1, y1, x2, y2),
+                        target_page_index=target_page_num - 1,
+                    )
+
+                    writer.add_annotation(
+                        page_number=toc_page_idx, annotation=annotation
+                    )
+
+                    page_obj = writer.pages[toc_page_idx]
+                    annotations = page_obj.get("/Annots", [])
+                    if annotations:
+                        last_annotation = annotations[-1]
+                        if hasattr(last_annotation, "get_object"):
+                            last_annotation = last_annotation.get_object()
+                        dest_name = (
+                            f"/{anchor_id}"
+                            if not anchor_id.startswith("/")
+                            else anchor_id
+                        )
+                        last_annotation[NameObject("/Dest")] = NameObject(dest_name)
+                    links_added += 1
+                    logger.debug(
+                        f"  Добавлена ссылка: {anchor_id} (страница TOC {toc_page_idx + 1} -> {target_page_num}, rect=[{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}])"
+                    )
+                except Exception as e:
+                    errors += 1
+                    logger.warning(
+                        f"Ошибка при добавлении ссылки для {anchor_id}: {e}",
+                        exc_info=True,
+                    )
+
+            logger.info(f"Добавлено {links_added} ссылок в оглавление")
+            if skipped_no_target > 0:
+                logger.warning(
+                    f"Пропущено {skipped_no_target} ссылок: нет целевой страницы"
+                )
+            if skipped_invalid_page > 0:
+                logger.warning(
+                    f"Пропущено {skipped_invalid_page} ссылок: неверный индекс страницы"
+                )
+            if errors > 0:
+                logger.warning(f"Ошибок при добавлении ссылок: {errors}")
 
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
@@ -2318,6 +2496,9 @@ async def main_async():
                     output_pdf,
                     toc_pages_count,
                     anchor_page_map_final,
+                    page,
+                    updated_toc_html,
+                    sections_to_process,
                 )
 
                 logger.info(
